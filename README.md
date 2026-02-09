@@ -220,7 +220,7 @@ If you encounter issues with the integration:
 5. **API connectivity**: 
    - Ensure the UniFi controller is accessible at the configured URL
    - Verify the NetBox API is reachable and responding
-   - The client auto-detects both UniFi OS (`/api/auth/login` with `/proxy/network`) and legacy controller (`/api/login`) API styles.
+   - The client supports Integration API v1 (`/proxy/network/integration/v1`) and also auto-detects UniFi OS (`/api/auth/login` with `/proxy/network`) and legacy controller (`/api/login`) session API styles.
 
 6. **Session issues**: If you encounter authentication problems, try deleting the session file and running again
 
