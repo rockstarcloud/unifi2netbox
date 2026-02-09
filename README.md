@@ -38,11 +38,19 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
 
 3. Create a `.env` file at the root of the project to store sensitive information such as usernames, passwords, and tokens. The `.env` file should look like this:
    ```plaintext
+   # Preferred for UniFi Integration API v1
+   UNIFI_API_KEY=your-unifi-api-key
+   # Optional, defaults to X-API-KEY
+   UNIFI_API_KEY_HEADER=X-API-KEY
+
+   # Optional fallback for legacy login flow
    UNIFI_USERNAME=your-unifi-username
    UNIFI_PASSWORD=your-unifi-password
    UNIFI_MFA_SECRET=your-unifi-mfa-secret
+
    NETBOX_TOKEN=your-netbox-api-token
    ```
+   The script supports both UniFi Integration API key auth and legacy username/password login.
    `UNIFI_MFA_SECRET` is optional if your UniFi account does not use TOTP-based 2FA.
 
 4. Copy the sample configuration file to `config/config.yaml`:
@@ -54,7 +62,10 @@ This project provides a mechanism to integrate **NetBox** with **UniFi**, allowi
    ```yaml
    UNIFI:
      URLS:
-       - https://<controller-ip>:8443
+       # Integration API v1 (recommended)
+       - https://<controller-ip>:11443/proxy/network/integration/v1
+       # Legacy example:
+       # - https://<controller-ip>:8443
    NETBOX:
      URL: http://localhost:8080
      ROLES:
@@ -202,7 +213,8 @@ If you encounter issues with the integration:
 3. **Verify site mapping**: Ensure your site mapping in `config/site_mapping.yaml` correctly maps UniFi sites to NetBox sites
 
 4. **Authentication issues**: 
-   - Verify your UniFi credentials and MFA secret in the `.env` file
+   - If using Integration API, verify `UNIFI_API_KEY` (and optionally `UNIFI_API_KEY_HEADER`) in `.env`
+   - If using legacy auth, verify `UNIFI_USERNAME`, `UNIFI_PASSWORD`, and optional `UNIFI_MFA_SECRET`
    - Check that your NetBox API token has appropriate permissions
 
 5. **API connectivity**: 
