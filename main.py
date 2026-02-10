@@ -29,6 +29,102 @@ MAX_DEVICE_THREADS = 8  # Number of devices to process concurrently per site
 netbox_device_roles = {}
 postable_fields_cache = {}
 postable_fields_lock = threading.Lock()
+vrf_cache = {}
+vrf_cache_lock = threading.Lock()
+vrf_locks = {}
+vrf_locks_lock = threading.Lock()
+
+
+def _get_vrf_lock(vrf_name: str) -> threading.Lock:
+    with vrf_locks_lock:
+        lock = vrf_locks.get(vrf_name)
+        if lock is None:
+            lock = threading.Lock()
+            vrf_locks[vrf_name] = lock
+    return lock
+
+
+def get_or_create_vrf(nb, vrf_name: str):
+    """
+    Get or create a VRF by name in a concurrency-safe way.
+
+    NetBox does not enforce VRF name uniqueness, so without a lock multiple
+    threads can create duplicates when processing devices in parallel.
+    """
+    with vrf_cache_lock:
+        cached = vrf_cache.get(vrf_name)
+    if cached:
+        return cached
+
+    with _get_vrf_lock(vrf_name):
+        with vrf_cache_lock:
+            cached = vrf_cache.get(vrf_name)
+        if cached:
+            return cached
+
+        existing = list(nb.ipam.vrfs.filter(name=vrf_name))
+        vrf = None
+        if existing:
+            # Pick the oldest (lowest id) to keep behavior stable when duplicates already exist.
+            vrf = sorted(existing, key=lambda item: item.id or 0)[0]
+            if len(existing) > 1:
+                logger.warning(
+                    f"Multiple VRFs with name {vrf_name} found. Using ID {vrf.id}."
+                )
+        else:
+            logger.debug(f"VRF {vrf_name} not found, creating new VRF")
+            try:
+                vrf = nb.ipam.vrfs.create({"name": vrf_name})
+                if vrf:
+                    logger.info(f"VRF {vrf_name} with ID {vrf.id} successfully added to NetBox.")
+            except pynetbox.core.query.RequestError as e:
+                logger.warning(f"Failed to create VRF {vrf_name}: {e}. Trying to refetch.")
+                existing = list(nb.ipam.vrfs.filter(name=vrf_name))
+                if existing:
+                    vrf = sorted(existing, key=lambda item: item.id or 0)[0]
+
+        if vrf:
+            with vrf_cache_lock:
+                vrf_cache[vrf_name] = vrf
+        return vrf
+
+
+def get_existing_vrf(nb, vrf_name: str):
+    """Get a VRF by name (do not create)."""
+    existing = list(nb.ipam.vrfs.filter(name=vrf_name))
+    if not existing:
+        return None
+    vrf = sorted(existing, key=lambda item: item.id or 0)[0]
+    if len(existing) > 1:
+        logger.warning(f"Multiple VRFs with name {vrf_name} found. Using ID {vrf.id}.")
+    return vrf
+
+
+def get_vrf_for_site(nb, site_name: str):
+    """
+    Decide VRF behavior based on env.
+
+    NETBOX_VRF_MODE:
+      - none/disabled/off: do not use VRF at all
+      - existing/get: use VRF if it exists, never create
+      - create/site (legacy behavior): create VRF if missing
+    """
+    mode = (os.getenv("NETBOX_VRF_MODE") or "existing").strip().lower()
+    if mode in {"none", "disabled", "off"}:
+        return None, mode
+
+    vrf_name = f"vrf_{site_name}"
+    if mode in {"create", "site"}:
+        vrf = get_or_create_vrf(nb, vrf_name)
+        return vrf, mode
+
+    if mode in {"existing", "get"}:
+        vrf = get_existing_vrf(nb, vrf_name)
+        return vrf, mode
+
+    logger.warning(f"Unknown NETBOX_VRF_MODE='{mode}'. Falling back to 'existing'.")
+    vrf = get_existing_vrf(nb, f"vrf_{site_name}")
+    return vrf, "existing"
 
 def get_postable_fields(base_url, token, url_path):
     """
@@ -530,29 +626,12 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             logger.warning(f"Missing serial/mac/id for device {device_name}. Skipping...")
             return
 
-        # VRF creation
-        vrf_name = f"vrf_{site}"
-        vrf = None
-        logger.debug(f"Checking for existing VRF: {vrf_name}")
-        try:
-            vrf = nb.ipam.vrfs.get(name=vrf_name)
-        except ValueError as e:
-            error_message = str(e)
-            if "get() returned more than one result." in error_message:
-                logger.warning(f"Multiple VRFs with name {vrf_name} found. Using 1st one in the list.")
-                vrfs = nb.ipam.vrfs.filter(name=vrf_name)
-                for vrf_item in vrfs:
-                    vrf = vrf_item
-                    break
-            else:
-                logger.exception(f"Failed to get VRF {vrf_name} for site {site}: {e}. Skipping...")
-                return
-
-        if not vrf:
-            logger.debug(f"VRF {vrf_name} not found, creating new VRF")
-            vrf = nb.ipam.vrfs.create({"name": vrf_name})
-            if vrf:
-                logger.info(f"VRF {vrf_name} with ID {vrf.id} successfully added to NetBox.")
+        # VRF handling (env-controlled). Default: do not create VRFs.
+        vrf, vrf_mode = get_vrf_for_site(nb, site.name)
+        if vrf:
+            logger.debug(f"Using VRF {vrf.name} (ID {vrf.id}) for site {site.name} (mode={vrf_mode})")
+        else:
+            logger.debug(f"Running without VRF for site {site.name} (mode={vrf_mode})")
 
         # Device Type creation
         logger.debug(f"Checking for existing device type: {device_model} (manufacturer ID: {nb_ubiquity.id})")
@@ -611,6 +690,11 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                                 f'{device_serial}.')
                 return None
 
+            # Device status on create (default: offline)
+            desired_status = (os.getenv("NETBOX_DEVICE_STATUS") or "offline").strip().lower()
+            if desired_status and "status" in available_fields:
+                device_data["status"] = desired_status
+
             # Add the device to Netbox
             logger.debug(f"Creating device in NetBox with data: {device_data}")
             nb_device = nb.dcim.devices.create(device_data)
@@ -647,7 +731,10 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             logger.warning(f"Invalid IP {device_ip} for device {device_name}. Skipping...")
             return
         # get the prefix that this IP address belongs to
-        prefixes = nb.ipam.prefixes.filter(contains=device_ip, vrf_id=vrf.id)
+        if vrf:
+            prefixes = nb.ipam.prefixes.filter(contains=device_ip, vrf_id=vrf.id)
+        else:
+            prefixes = nb.ipam.prefixes.filter(contains=device_ip)
         if not prefixes:
             logger.warning(f"No prefix found for IP {device_ip} for device {device_name}. Skipping...")
             return
@@ -660,11 +747,15 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             interface = nb.dcim.interfaces.get(device_id=nb_device.id, name="vlan.1")
             if not interface:
                 try:
-                    interface = nb.dcim.interfaces.create(device=nb_device.id,
-                                                          name="vlan.1",
-                                                          type="virtual",
-                                                          enabled=True,
-                                                          vrf_id=vrf.id,)
+                    iface_payload = {
+                        "device": nb_device.id,
+                        "name": "vlan.1",
+                        "type": "virtual",
+                        "enabled": True,
+                    }
+                    if vrf:
+                        iface_payload["vrf_id"] = vrf.id
+                    interface = nb.dcim.interfaces.create(**iface_payload)
                     if interface:
                         logger.info(
                             f"Interface vlan.1 for device {device_name} with ID {interface.id} successfully added to NetBox.")
@@ -672,17 +763,22 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                     logger.exception(
                         f"Failed to create interface vlan.1 for device {device_name} at site {site}: {e}")
                     return
-            nb_ip = nb.ipam.ip_addresses.get(address=ip, vrf_id=vrf.id, tenant_id=tenant.id)
+            ip_get_filters = {"address": ip, "tenant_id": tenant.id}
+            if vrf:
+                ip_get_filters["vrf_id"] = vrf.id
+            nb_ip = nb.ipam.ip_addresses.get(**ip_get_filters)
             if not nb_ip:
                 try:
-                    nb_ip = nb.ipam.ip_addresses.create({
+                    ip_payload = {
                         "assigned_object_id": interface.id,
                         "assigned_object_type": 'dcim.interface',
                         "address": ip,
-                        "vrf_id": vrf.id,
                         "tenant_id": tenant.id,
                         "status": "active",
-                    })
+                    }
+                    if vrf:
+                        ip_payload["vrf_id"] = vrf.id
+                    nb_ip = nb.ipam.ip_addresses.create(ip_payload)
                     if nb_ip:
                         logger.info(f"IP address {ip} with ID {nb_ip.id} successfully added to NetBox.")
                 except pynetbox.core.query.RequestError as e:
