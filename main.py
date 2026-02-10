@@ -109,22 +109,45 @@ def get_vrf_for_site(nb, site_name: str):
       - existing/get: use VRF if it exists, never create
       - create/site (legacy behavior): create VRF if missing
     """
+    site_name = (site_name or "").strip()
     mode = (os.getenv("NETBOX_VRF_MODE") or "existing").strip().lower()
     if mode in {"none", "disabled", "off"}:
         return None, mode
 
-    vrf_name = f"vrf_{site_name}"
+    # Prefer VRF name == site name (no prefix). Also try legacy "vrf_" prefix as fallback.
+    candidates = []
+    if site_name:
+        candidates.append(site_name)
+        if not site_name.lower().startswith("vrf_"):
+            candidates.append(f"vrf_{site_name}")
+    # De-dup
+    seen = set()
+    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+
+    preferred_name = candidates[0] if candidates else None
     if mode in {"create", "site"}:
-        vrf = get_or_create_vrf(nb, vrf_name)
+        if not preferred_name:
+            return None, mode
+        vrf = get_or_create_vrf(nb, preferred_name)
         return vrf, mode
 
     if mode in {"existing", "get"}:
-        vrf = get_existing_vrf(nb, vrf_name)
+        for name in candidates:
+            vrf = get_existing_vrf(nb, name)
+            if vrf:
+                if name.startswith("vrf_") and name != (site_name or ""):
+                    logger.warning(
+                        f"Using legacy VRF name '{name}'. Consider renaming it to '{site_name}'."
+                    )
+                return vrf, mode
         return vrf, mode
 
     logger.warning(f"Unknown NETBOX_VRF_MODE='{mode}'. Falling back to 'existing'.")
-    vrf = get_existing_vrf(nb, f"vrf_{site_name}")
-    return vrf, "existing"
+    for name in candidates:
+        vrf = get_existing_vrf(nb, name)
+        if vrf:
+            return vrf, "existing"
+    return None, "existing"
 
 def get_postable_fields(base_url, token, url_path):
     """
