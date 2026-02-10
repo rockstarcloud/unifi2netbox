@@ -4,6 +4,7 @@ from slugify import slugify
 import os
 import re
 import requests
+import subprocess
 import warnings
 import logging
 import pynetbox
@@ -41,6 +42,10 @@ _tag_lock = threading.Lock()
 _vlan_cache = {}
 _vlan_lock = threading.Lock()
 _cable_lock = threading.Lock()
+_dhcp_ranges_cache = None
+_dhcp_ranges_lock = threading.Lock()
+_assigned_static_ips = set()
+_assigned_static_ips_lock = threading.Lock()
 
 
 def _get_vrf_lock(vrf_name: str) -> threading.Lock:
@@ -353,6 +358,216 @@ def _parse_env_list(var_name):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_dhcp_ranges():
+    """Parse DHCP_RANGES env var into a list of ipaddress.IPv4Network objects. Cached."""
+    global _dhcp_ranges_cache
+    with _dhcp_ranges_lock:
+        if _dhcp_ranges_cache is not None:
+            return _dhcp_ranges_cache
+
+    raw_ranges = _parse_env_list("DHCP_RANGES")
+    if not raw_ranges:
+        with _dhcp_ranges_lock:
+            _dhcp_ranges_cache = []
+        return []
+
+    networks = []
+    for r in raw_ranges:
+        r = r.strip()
+        try:
+            networks.append(ipaddress.ip_network(r, strict=False))
+        except ValueError:
+            logger.warning(f"Invalid DHCP range '{r}' in DHCP_RANGES. Skipping.")
+
+    with _dhcp_ranges_lock:
+        _dhcp_ranges_cache = networks
+    logger.debug(f"Parsed {len(networks)} DHCP ranges: {[str(n) for n in networks]}")
+    return networks
+
+
+def is_ip_in_dhcp_range(ip_str):
+    """Return True if the given IP string falls within any configured DHCP range."""
+    dhcp_ranges = parse_dhcp_ranges()
+    if not dhcp_ranges:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in network for network in dhcp_ranges)
+
+
+def ping_ip(ip_str, count=2, timeout=1):
+    """Ping an IP address. Returns True if host responds (IP in use), False if not."""
+    try:
+        # Linux (Docker container): -W for timeout in seconds
+        cmd = ["ping", "-c", str(count), "-W", str(timeout), ip_str]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=count * timeout + 5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, Exception) as e:
+        logger.debug(f"Ping to {ip_str} failed/timed out: {e}")
+        return False
+
+
+def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips=None, max_attempts=10):
+    """
+    Find an available static IP in the given NetBox prefix that:
+    1. Is NOT within any configured DHCP range
+    2. Is NOT already used by any UniFi device
+    3. Is NOT already in NetBox
+    4. Does NOT respond to ping
+    Uses NetBox available-ips API. Returns IP string with mask (e.g. '10.88.88.5/22') or None.
+    """
+    dhcp_ranges = parse_dhcp_ranges()
+    subnet_mask = prefix_obj.prefix.split("/")[1]
+    prefix_id = prefix_obj.id
+    unifi_ips = unifi_device_ips or set()
+
+    # Use direct HTTP GET to list available IPs without creating them
+    netbox_url = os.getenv("NETBOX_URL", "").rstrip("/")
+    netbox_token = os.getenv("NETBOX_TOKEN", "")
+    url = f"{netbox_url}/api/ipam/prefixes/{prefix_id}/available-ips/"
+    headers = {"Authorization": f"Token {netbox_token}", "Accept": "application/json"}
+
+    try:
+        resp = requests.get(url, headers=headers, params={"limit": max_attempts * 5}, verify=False, timeout=10)
+        resp.raise_for_status()
+        candidates = resp.json()
+    except Exception as e:
+        logger.error(f"Failed to query available IPs for prefix {prefix_obj.prefix}: {e}")
+        return None
+
+    if not isinstance(candidates, list):
+        logger.error(f"Unexpected response from available-ips endpoint: {type(candidates)}")
+        return None
+
+    attempts = 0
+    for candidate in candidates:
+        if attempts >= max_attempts:
+            break
+
+        candidate_addr = candidate.get("address", "")
+        candidate_ip = candidate_addr.split("/")[0]
+
+        try:
+            addr = ipaddress.ip_address(candidate_ip)
+        except ValueError:
+            continue
+
+        # Skip if candidate is in DHCP range
+        if any(addr in net for net in dhcp_ranges):
+            continue
+
+        # Skip if already being assigned in this run (thread-safe)
+        with _assigned_static_ips_lock:
+            if candidate_ip in _assigned_static_ips:
+                logger.debug(f"Skipping {candidate_ip} — already being assigned this run")
+                continue
+
+        # Skip if any UniFi device already uses this IP
+        if candidate_ip in unifi_ips:
+            logger.debug(f"Skipping {candidate_ip} — already in use by a UniFi device")
+            continue
+
+        attempts += 1
+
+        # Ping check — skip if IP responds
+        if ping_ip(candidate_ip):
+            logger.warning(f"Candidate IP {candidate_ip} responds to ping — in use, skipping")
+            continue
+
+        # Reserve this IP to prevent concurrent assignment
+        with _assigned_static_ips_lock:
+            if candidate_ip in _assigned_static_ips:
+                continue  # Another thread grabbed it while we were pinging
+            _assigned_static_ips.add(candidate_ip)
+
+        logger.info(f"Found available static IP: {candidate_ip}/{subnet_mask}")
+        return f"{candidate_ip}/{subnet_mask}"
+
+    logger.warning(f"Could not find available static IP in {prefix_obj.prefix} after {attempts} attempts")
+    return None
+
+
+def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="255.255.252.0", gateway=None):
+    """
+    Set a static IP on a UniFi device via the controller API.
+    For Integration API: PUT /sites/{siteId}/devices/{deviceId}
+    """
+    device_id = device.get("id") or device.get("_id")
+    device_name = get_device_name(device)
+    if not device_id:
+        logger.warning(f"Cannot set static IP on {device_name}: no device ID")
+        return False
+
+    site_api_id = getattr(site_obj, "api_id", None) or getattr(site_obj, "_id", None)
+    if not site_api_id:
+        logger.warning(f"Cannot set static IP on {device_name}: no site API ID")
+        return False
+
+    # Determine gateway from prefix if not provided
+    if not gateway:
+        try:
+            network = ipaddress.ip_network(f"{static_ip}/{subnet_mask}", strict=False)
+            gateway = str(list(network.hosts())[0])  # First host in subnet
+        except Exception:
+            gateway = static_ip.rsplit(".", 1)[0] + ".1"  # Fallback: x.x.x.1
+
+    api_style = getattr(unifi, "api_style", "legacy")
+    if api_style == "integration":
+        url = f"/sites/{site_api_id}/devices/{device_id}"
+        payload = {
+            "ipConfig": {
+                "mode": "static",
+                "ip": static_ip,
+                "subnetMask": subnet_mask,
+                "gateway": gateway,
+            }
+        }
+        try:
+            response = unifi.make_request(url, "PUT", data=payload)
+            if isinstance(response, dict):
+                status = response.get("statusCode") or response.get("status")
+                if status and int(status) >= 400:
+                    logger.warning(f"Failed to set static IP on {device_name} via Integration API: {response.get('message', response)}")
+                    return False
+            logger.info(f"Set static IP {static_ip} on UniFi device {device_name}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to set static IP on {device_name}: {e}")
+            return False
+    else:
+        # Legacy API: PUT /api/s/{site}/rest/device/{id}
+        payload = {
+            "config_network": {
+                "type": "static",
+                "ip": static_ip,
+                "netmask": subnet_mask,
+                "gateway": gateway,
+            }
+        }
+        try:
+            site_name = getattr(site_obj, "name", "default")
+            url = f"/api/s/{site_name}/rest/device/{device_id}"
+            response = unifi.make_request(url, "PUT", data=payload)
+            if isinstance(response, dict):
+                meta = response.get("meta", {})
+                if isinstance(meta, dict) and meta.get("rc") == "ok":
+                    logger.info(f"Set static IP {static_ip} on UniFi device {device_name}")
+                    return True
+                logger.warning(f"Failed to set static IP on {device_name} via legacy API: {response}")
+                return False
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to set static IP on {device_name}: {e}")
+            return False
+
+
 def _parse_env_mapping(var_name):
     raw_value = os.getenv(var_name)
     if raw_value is None or not str(raw_value).strip():
@@ -584,15 +799,21 @@ def ensure_custom_field(nb, name, cf_type="text", content_types=None, label=None
         if cfs:
             cf = cfs[0]
         else:
-            cf = nb.extras.custom_fields.create({
-                "name": name,
-                "type": cf_type,
-                "content_types": content_types or ["dcim.device"],
-                "label": label or name.replace("_", " ").title(),
-                "filter_logic": "loose",
-            })
-            if cf:
-                logger.info(f"Created custom field '{name}' in NetBox.")
+            try:
+                cf = nb.extras.custom_fields.create({
+                    "name": name,
+                    "type": cf_type,
+                    "object_types": content_types or ["dcim.device"],
+                    "label": label or name.replace("_", " ").title(),
+                    "filter_logic": "loose",
+                })
+                if cf:
+                    logger.info(f"Created custom field '{name}' in NetBox.")
+            except Exception:
+                # Race condition: another thread created it; retry filter
+                cfs = list(nb.extras.custom_fields.filter(name=name))
+                if cfs:
+                    cf = cfs[0]
     except Exception as e:
         logger.warning(f"Could not ensure custom field '{name}': {e}")
     with _custom_field_lock:
@@ -1282,7 +1503,7 @@ def select_netbox_role_for_device(device):
     first_key = next(iter(netbox_device_roles))
     return netbox_device_roles[first_key], first_key
 
-def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
+def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ips=None, unifi_site_obj=None):
     """Process a device and add it to NetBox."""
     try:
         device_name = get_device_name(device)
@@ -1420,7 +1641,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
             # Sync physical interfaces from UniFi to NetBox
             try:
                 api_style = getattr(unifi, "api_style", "legacy") or "legacy"
-                sync_device_interfaces(nb, nb_device, device, api_style, unifi=unifi, site_obj=site)
+                sync_device_interfaces(nb, nb_device, device, api_style, unifi=unifi, site_obj=unifi_site_obj)
             except Exception as e:
                 logger.warning(f"Failed to sync interfaces for {device_name}: {e}")
 
@@ -1433,6 +1654,51 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
         except ValueError:
             logger.warning(f"Invalid IP {device_ip} for device {device_name}. Skipping...")
             return
+
+        # --- DHCP-to-static IP reassignment ---
+        if is_ip_in_dhcp_range(device_ip):
+            # Skip routers/gateways — they manage their own IPs
+            role_key = infer_role_key_for_device(device)
+            if role_key in ("GATEWAY", "ROUTER"):
+                logger.debug(f"Skipping DHCP-to-static for {device_name} — device is a {role_key}")
+            else:
+                # If device already has a static IP in NetBox, keep it
+                if nb_device and nb_device.primary_ip4:
+                    existing_ip_obj = nb.ipam.ip_addresses.get(id=nb_device.primary_ip4.id)
+                    if existing_ip_obj:
+                        existing_ip_str = str(existing_ip_obj.address).split("/")[0]
+                        if not is_ip_in_dhcp_range(existing_ip_str):
+                            logger.debug(
+                                f"Device {device_name} reports DHCP IP {device_ip} but NetBox "
+                                f"already has static IP {existing_ip_str}. Keeping existing."
+                            )
+                            return
+
+                logger.info(f"Device {device_name} has DHCP IP {device_ip}. Finding static IP...")
+                # Find prefix containing the DHCP IP
+                if vrf:
+                    dhcp_prefixes = list(nb.ipam.prefixes.filter(contains=device_ip, vrf_id=vrf.id))
+                else:
+                    dhcp_prefixes = list(nb.ipam.prefixes.filter(contains=device_ip))
+
+                if dhcp_prefixes:
+                    target_prefix = dhcp_prefixes[0]
+                    static_ip = find_available_static_ip(nb, target_prefix, vrf, tenant, unifi_device_ips=unifi_device_ips)
+                    if static_ip:
+                        logger.info(f"Reassigning {device_name} from DHCP {device_ip} to static {static_ip}")
+                        new_ip = static_ip.split("/")[0]
+                        # Set static IP on UniFi device
+                        if unifi_site_obj:
+                            subnet_mask_bits = int(static_ip.split("/")[1])
+                            subnet_mask = str(ipaddress.IPv4Network(f"0.0.0.0/{subnet_mask_bits}").netmask)
+                            set_unifi_device_static_ip(unifi, unifi_site_obj, device, new_ip, subnet_mask=subnet_mask)
+                        device_ip = new_ip
+                    else:
+                        logger.warning(f"No available static IP for {device_name}. Keeping DHCP IP {device_ip}.")
+                else:
+                    logger.warning(f"No prefix found for DHCP IP {device_ip}. Keeping DHCP IP.")
+        # --- End DHCP-to-static ---
+
         # get the prefix that this IP address belongs to
         if vrf:
             prefixes = nb.ipam.prefixes.filter(contains=device_ip, vrf_id=vrf.id)
@@ -1497,7 +1763,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant):
                         "assigned_object_type": 'dcim.interface',
                         "address": ip,
                         "tenant_id": tenant.id,
-                        "status": "offline",
+                        "status": "active",
                     }
                     if vrf:
                         ip_payload["vrf_id"] = vrf.id
@@ -1539,10 +1805,17 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
             devices = site_obj.device.all()
             logger.debug(f"Found {len(devices)} devices for site {site_display_name}")
 
+            # Collect all UniFi device IPs for DHCP-to-static checks
+            unifi_device_ips = set()
+            for d in devices:
+                dip = get_device_ip(d)
+                if dip:
+                    unifi_device_ips.add(dip)
+
             with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
                 futures = []
                 for device in devices:
-                    futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant))
+                    futures.append(executor.submit(process_device, unifi, nb, nb_site, device, nb_ubiquity, tenant, unifi_device_ips=unifi_device_ips, unifi_site_obj=site_obj))
 
                 for future in as_completed(futures):
                     try:
