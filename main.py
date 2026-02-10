@@ -410,8 +410,35 @@ def get_device_ip(device):
     return device.get("ip") or device.get("ipAddress")
 
 def get_device_serial(device):
-    # Integration API v1 does not expose serial in list payloads; use stable fallback.
-    return device.get("serial") or get_device_mac(device) or device.get("id")
+    """
+    Determine what to put in NetBox's `serial` field.
+
+    Controlled by env:
+      - NETBOX_SERIAL_MODE=mac   (default): use device.serial, else MAC, else id
+      - NETBOX_SERIAL_MODE=unifi: only use device.serial (no fallback)
+      - NETBOX_SERIAL_MODE=id    : use device.serial, else id
+      - NETBOX_SERIAL_MODE=none  : do not set serial in NetBox
+    """
+    def _normalize_serial(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        # If this is a MAC address (with separators) or 12 hex characters, normalize to compact uppercase.
+        if re.fullmatch(r"(?i)([0-9a-f]{2}[:-]){5}[0-9a-f]{2}", text) or re.fullmatch(r"(?i)[0-9a-f]{12}", text):
+            return re.sub(r"[^0-9A-Fa-f]", "", text).upper()
+        return text
+
+    mode = (os.getenv("NETBOX_SERIAL_MODE") or "mac").strip().lower()
+    if mode == "none":
+        return None
+    if mode in {"unifi", "serial"}:
+        return _normalize_serial(device.get("serial"))
+    if mode == "id":
+        return _normalize_serial(device.get("serial") or device.get("id"))
+    # default: mac
+    return _normalize_serial(device.get("serial") or get_device_mac(device) or device.get("id"))
 
 def is_access_point_device(device):
     ap_flag = device.get("is_access_point")
