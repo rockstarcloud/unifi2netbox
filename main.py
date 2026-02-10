@@ -530,7 +530,7 @@ def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="
             }
         }
         try:
-            response = unifi.make_request(url, "PUT", data=payload)
+            response = unifi.make_request(url, "PATCH", data=payload)
             if isinstance(response, dict):
                 status = response.get("statusCode") or response.get("status")
                 if status and int(status) >= 400:
@@ -1098,18 +1098,18 @@ def sync_site_wlans(nb, site_obj, nb_site, tenant):
         if isinstance(sec_config, dict):
             security = security or sec_config.get("type") or ""
 
-        # Map security to NetBox auth_type
+        # Map security to NetBox auth_type (NetBox 4.x: open, wep, wpa-personal, wpa-enterprise)
         sec_lower = str(security).lower()
-        if "wpa3" in sec_lower or "sae" in sec_lower:
-            auth_type = "wpa3-personal"
-        elif "wpa2" in sec_lower or "wpa" in sec_lower:
-            auth_type = "wpa2-personal"
-        elif "enterprise" in sec_lower:
-            auth_type = "wpa2-enterprise"
-        elif "open" in sec_lower:
+        if "enterprise" in sec_lower:
+            auth_type = "wpa-enterprise"
+        elif "wpa" in sec_lower or "sae" in sec_lower or "psk" in sec_lower:
+            auth_type = "wpa-personal"
+        elif "wep" in sec_lower:
+            auth_type = "wep"
+        elif "open" in sec_lower or "none" in sec_lower:
             auth_type = "open"
         else:
-            auth_type = "wpa2-personal"
+            auth_type = "wpa-personal"
 
         # Check if wireless LAN exists
         existing = None
@@ -1511,6 +1511,12 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         device_mac = get_device_mac(device)
         device_ip = get_device_ip(device)
         device_serial = get_device_serial(device)
+
+        # Skip offline/disconnected devices
+        device_state = (device.get("state") or device.get("status") or "").upper()
+        if device_state in ("OFFLINE", "DISCONNECTED", "0"):
+            logger.debug(f"Skipping offline device {device_name}")
+            return
 
         logger.info(f"Processing device {device_name} at site {site}...")
         logger.debug(f"Device details: Model={device_model}, MAC={device_mac}, IP={device_ip}, Serial={device_serial}")
