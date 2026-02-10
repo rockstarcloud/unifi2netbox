@@ -963,16 +963,34 @@ if __name__ == "__main__":
             continue
         normalized_key = str(role_key).upper()
         role_slug = slugify(role_name)
-        role_obj = nb.dcim.device_roles.get(slug=role_slug)
+        role_obj = None
+        try:
+            role_obj = nb.dcim.device_roles.get(slug=role_slug)
+        except ValueError:
+            # If multiple roles match (unexpected), just pick the first.
+            role_obj = next(iter(nb.dcim.device_roles.filter(slug=role_slug)), None)
         if not role_obj:
-            role_obj = nb.dcim.device_roles.create({'name': role_name, 'slug': role_slug})
-            if role_obj:
-                logger.info(f"Role {normalized_key} ({role_name}) with ID {role_obj.id} successfully added to NetBox.")
+            try:
+                role_obj = nb.dcim.device_roles.get(name=role_name)
+            except ValueError:
+                role_obj = next(iter(nb.dcim.device_roles.filter(name=role_name)), None)
+        if not role_obj:
+            try:
+                role_obj = nb.dcim.device_roles.create({'name': role_name, 'slug': role_slug})
+                if role_obj:
+                    logger.info(f"Role {normalized_key} ({role_name}) with ID {role_obj.id} successfully added to NetBox.")
+            except pynetbox.core.query.RequestError as e:
+                # Another process might have created it, or name/slug might already exist.
+                logger.warning(f"Failed to create role {normalized_key} ({role_name}): {e}. Trying to fetch existing role.")
+                try:
+                    role_obj = nb.dcim.device_roles.get(slug=role_slug) or nb.dcim.device_roles.get(name=role_name)
+                except ValueError:
+                    role_obj = None
         if role_obj:
             netbox_device_roles[normalized_key] = role_obj
 
     if not netbox_device_roles:
-        logger.exception("Could not load or create any roles from NETBOX.ROLES.")
+        logger.exception("Could not load or create any roles from NETBOX roles configuration.")
         raise SystemExit(1)
 
     logger.debug("Fetching all NetBox sites")
