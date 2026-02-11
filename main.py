@@ -421,7 +421,7 @@ def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips=None,
     2. Is NOT already used by any UniFi device
     3. Is NOT already in NetBox
     4. Does NOT respond to ping
-    Uses NetBox available-ips API. Returns IP string with mask (e.g. '10.88.88.5/22') or None.
+    Uses NetBox available-ips API. Returns IP string with mask (e.g. '192.168.1.5/24') or None.
     """
     dhcp_ranges = parse_dhcp_ranges()
     subnet_mask = prefix_obj.prefix.split("/")[1]
@@ -833,30 +833,42 @@ def ensure_custom_field(nb, name, cf_type="text", content_types=None, label=None
 
 
 def ensure_tag(nb, name, slug=None, color=None):
-    """Ensure a tag exists in NetBox. Returns the tag object."""
+    """Ensure a tag exists in NetBox. Returns the tag object.
+
+    Uses double-check locking to prevent duplicate tag creation
+    when multiple threads request the same tag concurrently.
+    """
     slug = slug or slugify(name)
+    # Fast path: check cache without blocking
     with _tag_lock:
         if slug in _tag_cache:
             return _tag_cache[slug]
-    tag = None
-    try:
-        tag = nb.extras.tags.get(slug=slug)
-        if not tag:
-            payload = {"name": name, "slug": slug}
-            if color:
-                payload["color"] = color
-            tag = nb.extras.tags.create(payload)
-            if tag:
-                logger.info(f"Created tag '{name}' in NetBox.")
-    except pynetbox.core.query.RequestError:
-        # Race condition: another thread created it
-        tag = nb.extras.tags.get(slug=slug)
-    if tag:
-        with _tag_lock:
+
+    # Slow path: hold lock for the entire get-or-create to close TOCTOU window
+    with _tag_lock:
+        # Double-check after acquiring lock
+        if slug in _tag_cache:
+            return _tag_cache[slug]
+
+        tag = None
+        try:
+            tag = nb.extras.tags.get(slug=slug)
+            if not tag:
+                payload = {"name": name, "slug": slug}
+                if color:
+                    payload["color"] = color
+                tag = nb.extras.tags.create(payload)
+                if tag:
+                    logger.info(f"Created tag '{name}' in NetBox.")
+        except pynetbox.core.query.RequestError:
+            # Race condition: another thread created it between get and create
+            tag = nb.extras.tags.get(slug=slug)
+
+        if tag:
             _tag_cache[slug] = tag
-    else:
-        logger.warning(f"Could not ensure tag '{name}' in NetBox")
-    return tag
+        else:
+            logger.warning(f"Could not ensure tag '{name}' in NetBox")
+        return tag
 
 
 def sync_device_state(nb, nb_device, device):

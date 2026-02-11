@@ -181,7 +181,7 @@ Roles are auto-created in NetBox if they do not exist.
 Example:
 
 ```
-DHCP_RANGES=10.88.91.0/24,10.100.0.0/16
+DHCP_RANGES=192.168.100.0/24,172.16.0.0/16
 ```
 
 Devices with IPs in these ranges are assigned a static IP from the
