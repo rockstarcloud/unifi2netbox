@@ -209,12 +209,26 @@ Roles are auto-created in NetBox if they do not exist.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DHCP_RANGES` | No | — | Comma-separated or JSON array of CIDR ranges |
+| `DHCP_AUTO_DISCOVER` | No | `true` | Auto-detect DHCP ranges from UniFi network configs |
+| `DHCP_RANGES` | No | — | Additional manual CIDR ranges (merged with auto-discovered) |
 
-Example:
+**Auto-discovery** (default): DHCP-enabled subnets are automatically
+extracted from UniFi's network configuration (`dhcpd_enabled` +
+`ip_subnet`). No manual configuration needed.
+
+Manual ranges from `DHCP_RANGES` are merged with auto-discovered
+ranges (duplicates are deduplicated).
+
+Example (manual override / addition):
 
 ```
 DHCP_RANGES=192.168.100.0/24,172.16.0.0/16
+```
+
+To disable auto-discovery and rely solely on manual ranges:
+
+```
+DHCP_AUTO_DISCOVER=false
 ```
 
 Devices with IPs in these ranges are assigned a static IP from the
@@ -368,7 +382,8 @@ When `SYNC_INTERFACES=true`:
 
 ### DHCP-to-Static IP Conversion
 
-When `DHCP_RANGES` is configured:
+When DHCP ranges are available (auto-discovered from UniFi and/or
+manually configured via `DHCP_RANGES`):
 
 1. If device IP falls within a DHCP range:
    - Check if device already has a static IP in NetBox → keep it

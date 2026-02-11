@@ -46,6 +46,8 @@ _dhcp_ranges_cache = None
 _dhcp_ranges_lock = threading.Lock()
 _assigned_static_ips = set()
 _assigned_static_ips_lock = threading.Lock()
+_unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
+_unifi_dhcp_ranges_lock = threading.Lock()
 
 
 def _get_vrf_lock(vrf_name: str) -> threading.Lock:
@@ -358,7 +360,7 @@ def _parse_env_list(var_name):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def parse_dhcp_ranges():
+def _parse_env_dhcp_ranges():
     """Parse DHCP_RANGES env var into a list of ipaddress.IPv4Network objects. Cached."""
     global _dhcp_ranges_cache
     with _dhcp_ranges_lock:
@@ -381,13 +383,124 @@ def parse_dhcp_ranges():
 
     with _dhcp_ranges_lock:
         _dhcp_ranges_cache = networks
-    logger.debug(f"Parsed {len(networks)} DHCP ranges: {[str(n) for n in networks]}")
+    logger.debug(f"Parsed {len(networks)} env DHCP ranges: {[str(n) for n in networks]}")
     return networks
 
 
+def _fetch_legacy_networkconf(unifi, site_obj):
+    """Fetch network configs via Legacy API (has DHCP fields).
+
+    The Integration API does not return dhcpd_enabled / ip_subnet,
+    so we fall back to the Legacy REST endpoint which includes the
+    full DHCP server configuration.
+
+    Uses the existing session with API key headers.
+    """
+    # Determine the site code for Legacy API path
+    site_code = (
+        getattr(site_obj, "internal_reference", None)
+        or getattr(site_obj, "name", None)
+        or "default"
+    )
+    # Build Legacy endpoint — strip integration path to get base host
+    base = unifi.base_url
+    if "/proxy/network/integration" in base:
+        base = base.split("/proxy/network/integration")[0]
+    elif "/integration/" in base:
+        base = base.split("/integration/")[0]
+    url = f"{base}/proxy/network/api/s/{site_code}/rest/networkconf"
+
+    try:
+        # Reuse the auth headers discovered during Integration API setup
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        auth_headers = getattr(unifi, "integration_auth_headers", None) or {}
+        headers.update(auth_headers)
+
+        resp = unifi.session.get(url, headers=headers, verify=False, timeout=unifi.request_timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and "data" in data:
+                return data["data"]
+            if isinstance(data, list):
+                return data
+        else:
+            logger.debug(f"Legacy networkconf returned HTTP {resp.status_code} for site {site_code}")
+    except Exception as e:
+        logger.debug(f"Legacy networkconf fallback failed for site {site_code}: {e}")
+    return None
+
+
+def extract_dhcp_ranges_from_unifi(site_obj, unifi=None):
+    """Extract DHCP ranges from UniFi network configs for a site.
+
+    Returns a list of ipaddress.IPv4Network objects representing
+    subnets where DHCP is enabled.
+
+    For Integration API controllers (which lack DHCP fields), falls
+    back to the Legacy API endpoint automatically.
+    """
+    networks_result = []
+    try:
+        net_configs = site_obj.network_conf.all()
+    except Exception as e:
+        logger.warning(f"Could not fetch network configs for DHCP range extraction: {e}")
+        return networks_result
+
+    # Check if Integration API returned limited data (no dhcpd_enabled field)
+    if net_configs and "dhcpd_enabled" not in net_configs[0] and unifi:
+        logger.debug("Integration API lacks DHCP fields, falling back to Legacy API")
+        legacy_configs = _fetch_legacy_networkconf(unifi, site_obj)
+        if legacy_configs:
+            net_configs = legacy_configs
+        else:
+            logger.debug("Legacy API fallback returned no data")
+            return networks_result
+
+    for net in net_configs:
+        net_name = net.get("name") or net.get("purpose") or "unknown"
+
+        # Check if DHCP server is enabled on this network
+        dhcp_enabled = net.get("dhcpd_enabled") or net.get("dhcpdEnabled") or False
+        if not dhcp_enabled:
+            continue
+
+        # Get the subnet
+        subnet = net.get("ip_subnet") or net.get("subnet")
+        if not subnet:
+            continue
+
+        try:
+            network = ipaddress.ip_network(subnet, strict=False)
+            networks_result.append(network)
+            logger.debug(f"Found DHCP-enabled network '{net_name}': {subnet}")
+        except ValueError:
+            logger.warning(f"Invalid subnet '{subnet}' in UniFi network config. Skipping.")
+
+    return networks_result
+
+
+def get_all_dhcp_ranges():
+    """Return merged DHCP ranges from env var + all discovered UniFi sites."""
+    env_ranges = _parse_env_dhcp_ranges()
+    with _unifi_dhcp_ranges_lock:
+        unifi_ranges = []
+        for ranges in _unifi_dhcp_ranges.values():
+            unifi_ranges.extend(ranges)
+
+    # Deduplicate by network address
+    seen = set()
+    merged = []
+    for net in env_ranges + unifi_ranges:
+        key = str(net)
+        if key not in seen:
+            seen.add(key)
+            merged.append(net)
+    return merged
+
+
 def is_ip_in_dhcp_range(ip_str):
-    """Return True if the given IP string falls within any configured DHCP range."""
-    dhcp_ranges = parse_dhcp_ranges()
+    """Return True if the given IP string falls within any configured or discovered DHCP range."""
+    dhcp_ranges = get_all_dhcp_ranges()
     if not dhcp_ranges:
         return False
     try:
@@ -423,7 +536,7 @@ def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips=None,
     4. Does NOT respond to ping
     Uses NetBox available-ips API. Returns IP string with mask (e.g. '192.168.1.5/24') or None.
     """
-    dhcp_ranges = parse_dhcp_ranges()
+    dhcp_ranges = get_all_dhcp_ranges()
     subnet_mask = prefix_obj.prefix.split("/")[1]
     prefix_id = prefix_obj.id
     unifi_ips = unifi_device_ips or set()
@@ -2157,6 +2270,20 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
                     sync_site_wlans(nb, site_obj, nb_site, tenant)
                 except Exception as e:
                     logger.warning(f"Failed to sync WLANs for site {site_display_name}: {e}")
+
+            # Auto-discover DHCP ranges from UniFi network configs
+            if os.getenv("DHCP_AUTO_DISCOVER", "true").strip().lower() in ("true", "1", "yes"):
+                try:
+                    site_dhcp_ranges = extract_dhcp_ranges_from_unifi(site_obj, unifi=unifi)
+                    if site_dhcp_ranges:
+                        with _unifi_dhcp_ranges_lock:
+                            _unifi_dhcp_ranges[nb_site.id] = site_dhcp_ranges
+                        logger.info(
+                            f"Discovered {len(site_dhcp_ranges)} DHCP range(s) from UniFi "
+                            f"for site {site_display_name}: {[str(n) for n in site_dhcp_ranges]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to extract DHCP ranges for site {site_display_name}: {e}")
 
             logger.debug(f"Fetching devices for site: {site_display_name}")
             devices = site_obj.device.all()
