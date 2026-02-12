@@ -48,6 +48,8 @@ _assigned_static_ips = set()
 _assigned_static_ips_lock = threading.Lock()
 _unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = threading.Lock()
+_cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
+_cleanup_serials_lock = threading.Lock()
 
 
 def _get_vrf_lock(vrf_name: str) -> threading.Lock:
@@ -1829,17 +1831,163 @@ UNIFI_MODEL_SPECS = {
 _device_type_specs_done = set()
 _device_type_specs_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+#  Community device-type library (netbox-community/devicetype-library)
+# ---------------------------------------------------------------------------
+_community_specs = None
+
+
+def _load_community_specs():
+    """Load community device specs from bundled JSON file (lazy, cached)."""
+    global _community_specs
+    if _community_specs is not None:
+        return _community_specs
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ubiquiti_device_specs.json")
+    if not os.path.exists(json_path):
+        logger.warning(f"Community device specs file not found: {json_path}")
+        _community_specs = {"by_part": {}, "by_model": {}}
+        return _community_specs
+    try:
+        with open(json_path, "r") as fh:
+            _community_specs = json.load(fh)
+        logger.info(f"Loaded community device specs: {len(_community_specs.get('by_part', {}))} by part, "
+                     f"{len(_community_specs.get('by_model', {}))} by model")
+    except Exception as e:
+        logger.warning(f"Failed to load community device specs: {e}")
+        _community_specs = {"by_part": {}, "by_model": {}}
+    return _community_specs
+
+
+def _lookup_community_specs(part_number=None, model=None):
+    """Look up community specs by part number or model name (case-insensitive)."""
+    specs = _load_community_specs()
+    # Try part_number first
+    if part_number:
+        hit = specs["by_part"].get(part_number)
+        if hit:
+            return hit
+        # Case-insensitive fallback
+        pn_upper = part_number.upper()
+        for key, val in specs["by_part"].items():
+            if key.upper() == pn_upper:
+                return val
+    # Try model name
+    if model:
+        hit = specs["by_model"].get(model)
+        if hit:
+            return hit
+        model_upper = model.upper()
+        for key, val in specs["by_model"].items():
+            if key.upper() == model_upper:
+                return val
+    return None
+
+
+def _resolve_device_specs(model):
+    """Resolve full device specs by merging UNIFI_MODEL_SPECS with community library.
+
+    Hardcoded specs overlay community data so manual overrides always win.
+    Returns merged dict or None if neither source has data.
+    """
+    hardcoded = UNIFI_MODEL_SPECS.get(model)
+    part_number = hardcoded.get("part_number") if hardcoded else None
+
+    # Look up community specs by part_number or model name
+    community = _lookup_community_specs(part_number=part_number, model=model)
+    # Fallback: try model code as part_number (e.g. "US48PRO" might match)
+    if not community and not part_number:
+        community = _lookup_community_specs(part_number=model)
+
+    if not community and not hardcoded:
+        return None
+
+    # Merge: community base, hardcoded overlay
+    merged = {}
+    if community:
+        merged.update(community)
+    if hardcoded:
+        merged.update(hardcoded)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+#  Generic template sync (interfaces, console ports, power ports)
+# ---------------------------------------------------------------------------
+
+def _sync_templates(nb, nb_device_type, model, template_endpoint, expected, label):
+    """Generic sync for interface/console-port/power-port templates.
+
+    *expected* is a list of dicts, each with at least 'name' and 'type'.
+    *template_endpoint* is the pynetbox endpoint (e.g. nb.dcim.interface_templates).
+    *label* is used for log messages (e.g. "interface", "console-port").
+    """
+    dt_id = int(nb_device_type.id)
+    existing_templates = list(template_endpoint.filter(device_type_id=dt_id))
+
+    # De-duplicate existing
+    existing_by_name = {}
+    for tmpl in existing_templates:
+        key = tmpl.name
+        if key not in existing_by_name:
+            existing_by_name[key] = tmpl
+        else:
+            try:
+                tmpl.delete()
+                logger.debug(f"Deleted duplicate {label} template '{key}' from {model}")
+            except Exception:
+                pass
+
+    # Build comparison sets
+    expected_set = set()
+    for e in expected:
+        expected_set.add((e["name"], e.get("type", "")))
+
+    existing_set = set()
+    for name, tmpl in existing_by_name.items():
+        tmpl_type = tmpl.type.value if tmpl.type else ""
+        existing_set.add((name, tmpl_type))
+
+    if expected_set == existing_set:
+        logger.debug(f"{label.capitalize()} templates for {model} already correct ({len(expected_set)})")
+        return
+
+    logger.debug(f"{label.capitalize()} template mismatch for {model}: "
+                 f"expected={len(expected_set)}, existing={len(existing_set)}")
+
+    # Delete all and recreate
+    for tmpl in existing_by_name.values():
+        try:
+            tmpl.delete()
+        except Exception:
+            pass
+
+    for entry in expected:
+        create_data = {
+            "device_type": dt_id,
+            "name": entry["name"],
+            "type": entry.get("type", ""),
+        }
+        # Pass through optional fields
+        for opt_field in ("mgmt_only", "poe_mode", "poe_type", "label",
+                          "maximum_draw", "allocated_draw"):
+            if opt_field in entry and entry[opt_field] is not None:
+                create_data[opt_field] = entry[opt_field]
+        try:
+            template_endpoint.create(create_data)
+        except pynetbox.core.query.RequestError:
+            pass
+    logger.info(f"Synced {len(expected)} {label} templates for {model}")
+
 
 def ensure_device_type_specs(nb, nb_device_type, model):
     """Ensure a device type has correct specs (part number, u_height, interface templates)
-    based on the UNIFI_MODEL_SPECS database. Also cleans up duplicate templates."""
-    specs = UNIFI_MODEL_SPECS.get(model)
+    based on merged UNIFI_MODEL_SPECS + community library. Also syncs console/power port templates."""
+    specs = _resolve_device_specs(model)
     if not specs:
         return
 
     # Serialize all template operations to prevent concurrent API races
     with _device_type_specs_lock:
-        # Only process each device type once per run
         if nb_device_type.id in _device_type_specs_done:
             return
         _device_type_specs_done.add(nb_device_type.id)
@@ -1857,6 +2005,24 @@ def _ensure_device_type_specs_inner(nb, nb_device_type, model, specs):
     if specs.get("u_height") is not None and nb_device_type.u_height != specs["u_height"]:
         nb_device_type.u_height = specs["u_height"]
         changed = True
+    # is_full_depth
+    if specs.get("is_full_depth") is not None and getattr(nb_device_type, "is_full_depth", None) != specs["is_full_depth"]:
+        nb_device_type.is_full_depth = specs["is_full_depth"]
+        changed = True
+    # airflow
+    if specs.get("airflow") and getattr(nb_device_type, "airflow", None) != specs["airflow"]:
+        nb_device_type.airflow = specs["airflow"]
+        changed = True
+    # weight
+    if specs.get("weight") is not None:
+        try:
+            w = float(specs["weight"])
+            if getattr(nb_device_type, "weight", None) != w:
+                nb_device_type.weight = w
+                nb_device_type.weight_unit = specs.get("weight_unit", "kg")
+                changed = True
+        except (ValueError, TypeError):
+            pass
     # Add PoE budget as comment if available
     poe = specs.get("poe_budget", 0)
     expected_comments = f"PoE budget: {poe}W" if poe else ""
@@ -1871,74 +2037,57 @@ def _ensure_device_type_specs_inner(nb, nb_device_type, model, specs):
         except Exception as e:
             logger.warning(f"Failed to update device type specs for {model}: {e}")
 
-    # Sync interface templates — delete all existing and recreate from specs
-    dt_id = int(nb_device_type.id)
-    existing_templates = list(nb.dcim.interface_templates.filter(device_type_id=dt_id))
-    logger.debug(f"Fetched {len(existing_templates)} existing templates for {model} (device_type_id={dt_id})")
-    expected_ports = []
-    for port_spec in specs.get("ports", []):
-        pattern, port_type, count = port_spec
-        if count == 1 and "{n}" not in pattern and "{n+" not in pattern:
-            # Single named port (e.g. "WAN 1", "eth0")
-            expected_ports.append((pattern, port_type))
-        elif "{n+" in pattern:
-            # Offset pattern like "Port {n+16}" — start numbering at offset+1
-            import re as _re
-            m = _re.search(r'\{n\+(\d+)\}', pattern)
-            offset = int(m.group(1)) if m else 0
-            base_pattern = _re.sub(r'\{n\+\d+\}', '{}', pattern)
-            for i in range(1, count + 1):
-                name = base_pattern.format(offset + i)
-                expected_ports.append((name, port_type))
-        else:
-            for i in range(1, count + 1):
-                name = pattern.replace("{n}", str(i))
-                expected_ports.append((name, port_type))
+    # --- Sync interface templates ---
+    expected_ifaces = []
+    # Prefer community 'interfaces' list (richer: poe_mode, poe_type, mgmt_only)
+    if specs.get("interfaces"):
+        for iface in specs["interfaces"]:
+            entry = {"name": iface["name"], "type": iface.get("type", "1000base-t")}
+            if iface.get("mgmt_only"):
+                entry["mgmt_only"] = True
+            if iface.get("poe_mode"):
+                entry["poe_mode"] = iface["poe_mode"]
+            if iface.get("poe_type"):
+                entry["poe_type"] = iface["poe_type"]
+            expected_ifaces.append(entry)
+    elif specs.get("ports"):
+        # Fallback to hardcoded ports tuple format
+        for port_spec in specs["ports"]:
+            pattern, port_type, count = port_spec
+            if count == 1 and "{n}" not in pattern and "{n+" not in pattern:
+                expected_ifaces.append({"name": pattern, "type": port_type})
+            elif "{n+" in pattern:
+                import re as _re
+                m = _re.search(r'\{n\+(\d+)\}', pattern)
+                offset = int(m.group(1)) if m else 0
+                base_pattern = _re.sub(r'\{n\+\d+\}', '{}', pattern)
+                for i in range(1, count + 1):
+                    expected_ifaces.append({"name": base_pattern.format(offset + i), "type": port_type})
+            else:
+                for i in range(1, count + 1):
+                    expected_ifaces.append({"name": pattern.replace("{n}", str(i)), "type": port_type})
 
-    # Build set of what exists
-    existing_by_name = {}
-    for tmpl in existing_templates:
-        key = tmpl.name
-        if key not in existing_by_name:
-            existing_by_name[key] = tmpl
-        else:
-            # Duplicate template — delete it
-            try:
-                tmpl.delete()
-                logger.debug(f"Deleted duplicate template '{key}' from {model}")
-            except Exception:
-                pass
+    if expected_ifaces:
+        _sync_templates(nb, nb_device_type, model, nb.dcim.interface_templates, expected_ifaces, "interface")
 
-    # Check if templates already match
-    expected_set = set((name, ptype) for name, ptype in expected_ports)
-    existing_set = set()
-    for name, tmpl in existing_by_name.items():
-        tmpl_type = tmpl.type.value if tmpl.type else ""
-        existing_set.add((name, tmpl_type))
+    # --- Sync console port templates ---
+    if specs.get("console_ports"):
+        expected_console = []
+        for cp in specs["console_ports"]:
+            expected_console.append({"name": cp["name"], "type": cp.get("type", "rj-45")})
+        _sync_templates(nb, nb_device_type, model, nb.dcim.console_port_templates, expected_console, "console-port")
 
-    if expected_set == existing_set:
-        logger.debug(f"Interface templates for {model} already correct ({len(expected_set)} ports)")
-        return  # Templates already correct
-
-    logger.debug(f"Template mismatch for {model}: expected={sorted(expected_set)}, existing={sorted(existing_set)}")
-
-    # Delete all existing templates and recreate
-    for tmpl in existing_by_name.values():
-        try:
-            tmpl.delete()
-        except Exception:
-            pass
-
-    for name, port_type in expected_ports:
-        try:
-            nb.dcim.interface_templates.create({
-                "device_type": nb_device_type.id,
-                "name": name,
-                "type": port_type,
-            })
-        except pynetbox.core.query.RequestError:
-            pass  # May already exist from race condition
-    logger.info(f"Synced {len(expected_ports)} interface templates for {model}")
+    # --- Sync power port templates ---
+    if specs.get("power_ports"):
+        expected_power = []
+        for pp in specs["power_ports"]:
+            entry = {"name": pp["name"], "type": pp.get("type", "iec-60320-c14")}
+            if pp.get("maximum_draw") is not None:
+                entry["maximum_draw"] = pp["maximum_draw"]
+            if pp.get("allocated_draw") is not None:
+                entry["allocated_draw"] = pp["allocated_draw"]
+            expected_power.append(entry)
+        _sync_templates(nb, nb_device_type, model, nb.dcim.power_port_templates, expected_power, "power-port")
 
 
 def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ips=None, unifi_site_obj=None):
@@ -1979,8 +2128,29 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
         nb_device_type = nb.dcim.device_types.get(model=device_model, manufacturer_id=nb_ubiquity.id)
         if not nb_device_type:
             try:
-                nb_device_type = nb.dcim.device_types.create({"manufacturer": nb_ubiquity.id, "model": device_model,
-                                                              "slug": slugify(f'{nb_ubiquity.name}-{device_model}')})
+                # Pre-populate from community specs when creating a new device type
+                specs = _resolve_device_specs(device_model)
+                create_data = {
+                    "manufacturer": nb_ubiquity.id,
+                    "model": device_model,
+                    "slug": (specs or {}).get("slug") or slugify(f'{nb_ubiquity.name}-{device_model}'),
+                }
+                if specs:
+                    if specs.get("part_number"):
+                        create_data["part_number"] = specs["part_number"]
+                    if specs.get("u_height") is not None:
+                        create_data["u_height"] = specs["u_height"]
+                    if specs.get("is_full_depth") is not None:
+                        create_data["is_full_depth"] = specs["is_full_depth"]
+                    if specs.get("airflow"):
+                        create_data["airflow"] = specs["airflow"]
+                    if specs.get("weight") is not None:
+                        try:
+                            create_data["weight"] = float(specs["weight"])
+                            create_data["weight_unit"] = specs.get("weight_unit", "kg")
+                        except (ValueError, TypeError):
+                            pass
+                nb_device_type = nb.dcim.device_types.create(create_data)
                 if nb_device_type:
                     logger.info(f"Device type {device_model} with ID {nb_device_type.id} successfully added to NetBox.")
             except pynetbox.core.query.RequestError as e:
@@ -2291,10 +2461,18 @@ def process_site(unifi, nb, site_obj, site_display_name, nb_site, nb_ubiquity, t
 
             # Collect all UniFi device IPs for DHCP-to-static checks
             unifi_device_ips = set()
+            # Also collect serials for cleanup phase
+            site_serials = set()
             for d in devices:
                 dip = get_device_ip(d)
                 if dip:
                     unifi_device_ips.add(dip)
+                ds = get_device_serial(d)
+                if ds:
+                    site_serials.add(ds)
+            # Store serials for cleanup
+            with _cleanup_serials_lock:
+                _cleanup_serials_by_site[nb_site.id] = site_serials
 
             with ThreadPoolExecutor(max_workers=MAX_DEVICE_THREADS) as executor:
                 futures = []
@@ -2457,6 +2635,193 @@ def process_all_controllers(unifi_url_list, unifi_username, unifi_password, unif
                 logger.exception(f"Error processing one of the UniFi controllers {url}: {e}")
                 continue
 
+# ---------------------------------------------------------------------------
+#  NetBox Cleanup Functions
+# ---------------------------------------------------------------------------
+
+def _is_cleanup_enabled():
+    """Check if cleanup is enabled via NETBOX_CLEANUP env var."""
+    return os.getenv("NETBOX_CLEANUP", "false").strip().lower() in ("true", "1", "yes")
+
+
+def _cleanup_stale_days():
+    """Get the stale device grace period in days."""
+    try:
+        return int(os.getenv("CLEANUP_STALE_DAYS", "30"))
+    except (ValueError, TypeError):
+        return 30
+
+
+def cleanup_stale_devices(nb, nb_site, tenant, unifi_serials):
+    """Delete devices at a site that are no longer present in UniFi.
+
+    Only deletes devices that have been offline for longer than CLEANUP_STALE_DAYS.
+    When CLEANUP_STALE_DAYS=0, all stale devices are deleted immediately.
+    """
+    grace_days = _cleanup_stale_days()
+    nb_devices = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+    deleted = 0
+    for dev in nb_devices:
+        serial = str(dev.serial or "").upper().replace(":", "")
+        if not serial:
+            continue
+        if serial in unifi_serials:
+            continue
+        # Device not found in UniFi — check grace period
+        if grace_days > 0:
+            # Use last_updated as proxy for "last seen"
+            import datetime
+            last_updated = getattr(dev, "last_updated", None)
+            if last_updated:
+                try:
+                    if isinstance(last_updated, str):
+                        lu = datetime.datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                    else:
+                        lu = last_updated
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    age_days = (now - lu).days
+                    if age_days < grace_days:
+                        logger.debug(f"Stale device {dev.name} ({serial}) last updated {age_days}d ago, "
+                                     f"grace={grace_days}d — skipping")
+                        continue
+                except Exception:
+                    pass
+        # Delete the device and its interfaces/IPs
+        try:
+            dev.delete()
+            deleted += 1
+            logger.info(f"Cleanup: deleted stale device {dev.name} ({serial}) from site {nb_site.name}")
+        except Exception as e:
+            logger.warning(f"Cleanup: failed to delete stale device {dev.name}: {e}")
+    if deleted:
+        logger.info(f"Cleanup: deleted {deleted} stale device(s) from site {nb_site.name}")
+    return deleted
+
+
+def cleanup_orphan_interfaces(nb, nb_site, tenant):
+    """Delete garbage interfaces (names containing '?') at a site."""
+    nb_devices = list(nb.dcim.devices.filter(site_id=nb_site.id, tenant_id=tenant.id))
+    deleted = 0
+    for dev in nb_devices:
+        ifaces = list(nb.dcim.interfaces.filter(device_id=dev.id))
+        for iface in ifaces:
+            if "?" in (iface.name or ""):
+                try:
+                    iface.delete()
+                    deleted += 1
+                    logger.debug(f"Cleanup: deleted garbage interface '{iface.name}' on {dev.name}")
+                except Exception as e:
+                    logger.warning(f"Cleanup: failed to delete interface '{iface.name}' on {dev.name}: {e}")
+    if deleted:
+        logger.info(f"Cleanup: deleted {deleted} garbage interface(s) from site {nb_site.name}")
+    return deleted
+
+
+def cleanup_orphan_ips(nb, tenant):
+    """Delete IP addresses that have no assigned object (orphaned)."""
+    all_ips = list(nb.ipam.ip_addresses.filter(tenant_id=tenant.id))
+    deleted = 0
+    for ip in all_ips:
+        if ip.assigned_object is None and ip.assigned_object_id is None:
+            try:
+                ip.delete()
+                deleted += 1
+                logger.debug(f"Cleanup: deleted orphan IP {ip.address}")
+            except Exception as e:
+                logger.warning(f"Cleanup: failed to delete orphan IP {ip.address}: {e}")
+    if deleted:
+        logger.info(f"Cleanup: deleted {deleted} orphan IP(s)")
+    return deleted
+
+
+def cleanup_orphan_cables(nb, nb_site):
+    """Delete cables at a site where one or both terminations are missing."""
+    try:
+        cables = list(nb.dcim.cables.filter(site_id=nb_site.id))
+    except Exception:
+        cables = list(nb.dcim.cables.all())
+    deleted = 0
+    for cable in cables:
+        a_ok = getattr(cable, "a_terminations", None)
+        b_ok = getattr(cable, "b_terminations", None)
+        if not a_ok or not b_ok:
+            try:
+                cable.delete()
+                deleted += 1
+                logger.debug(f"Cleanup: deleted orphan cable {cable.id}")
+            except Exception as e:
+                logger.warning(f"Cleanup: failed to delete orphan cable {cable.id}: {e}")
+    if deleted:
+        logger.info(f"Cleanup: deleted {deleted} orphan cable(s) from site {nb_site.name}")
+    return deleted
+
+
+def cleanup_device_types(nb, nb_ubiquity):
+    """Refresh device type specs and delete unused device types (device_count == 0)."""
+    all_types = list(nb.dcim.device_types.filter(manufacturer_id=nb_ubiquity.id))
+    refreshed = 0
+    deleted = 0
+    for dt in all_types:
+        # Refresh specs from community + hardcoded
+        model = dt.model
+        specs = _resolve_device_specs(model)
+        if specs:
+            try:
+                _ensure_device_type_specs_inner(nb, dt, model, specs)
+                refreshed += 1
+            except Exception as e:
+                logger.warning(f"Cleanup: failed to refresh specs for device type {model}: {e}")
+        # Delete unused device types
+        device_count = getattr(dt, "device_count", None)
+        if device_count is not None and device_count == 0:
+            try:
+                dt.delete()
+                deleted += 1
+                logger.info(f"Cleanup: deleted unused device type {model}")
+            except Exception as e:
+                logger.warning(f"Cleanup: failed to delete unused device type {model}: {e}")
+    logger.info(f"Cleanup: refreshed {refreshed} device type(s), deleted {deleted} unused device type(s)")
+    return deleted
+
+
+def run_netbox_cleanup(nb, nb_ubiquity, tenant, netbox_sites_dict, all_unifi_serials_by_site):
+    """Orchestrate all cleanup functions."""
+    if not _is_cleanup_enabled():
+        logger.debug("NetBox cleanup is disabled (NETBOX_CLEANUP != true)")
+        return
+
+    logger.info("=== Starting NetBox cleanup ===")
+
+    # Per-site cleanup
+    for site_name, nb_site in netbox_sites_dict.items():
+        site_serials = all_unifi_serials_by_site.get(nb_site.id, set())
+        try:
+            cleanup_stale_devices(nb, nb_site, tenant, site_serials)
+        except Exception as e:
+            logger.warning(f"Cleanup error (stale devices) at site {site_name}: {e}")
+        try:
+            cleanup_orphan_interfaces(nb, nb_site, tenant)
+        except Exception as e:
+            logger.warning(f"Cleanup error (orphan interfaces) at site {site_name}: {e}")
+        try:
+            cleanup_orphan_cables(nb, nb_site)
+        except Exception as e:
+            logger.warning(f"Cleanup error (orphan cables) at site {site_name}: {e}")
+
+    # Global cleanup (not per-site)
+    try:
+        cleanup_orphan_ips(nb, tenant)
+    except Exception as e:
+        logger.warning(f"Cleanup error (orphan IPs): {e}")
+
+    try:
+        cleanup_device_types(nb, nb_ubiquity)
+    except Exception as e:
+        logger.warning(f"Cleanup error (device types): {e}")
+
+    logger.info("=== NetBox cleanup complete ===")
+
+
 if __name__ == "__main__":
     # Parse command line arguments
     import argparse
@@ -2594,6 +2959,31 @@ if __name__ == "__main__":
         if nb_ubiquity:
             logger.info(f"Ubiquity manufacturer with ID {nb_ubiquity.id} successfully added to Netbox.")
 
-    # Process all UniFi controllers in parallel
-    process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret, unifi_api_key, unifi_api_key_header, nb, nb_ubiquity,
-                            tenant, netbox_sites_dict, config)
+    # Sync loop — run once or continuously based on SYNC_INTERVAL
+    sync_interval = int(os.getenv("SYNC_INTERVAL", "0"))
+    import time as _time
+    run_count = 0
+    while True:
+        run_count += 1
+        # Clear per-run caches on subsequent runs
+        if run_count > 1:
+            _device_type_specs_done.clear()
+            _cleanup_serials_by_site.clear()
+            _unifi_dhcp_ranges.clear()
+
+        logger.info(f"=== Sync run #{run_count} starting ===")
+
+        # Process all UniFi controllers in parallel
+        process_all_controllers(unifi_url_list, unifi_username, unifi_password, unifi_mfa_secret,
+                                unifi_api_key, unifi_api_key_header, nb, nb_ubiquity,
+                                tenant, netbox_sites_dict, config)
+
+        # Run cleanup after sync
+        run_netbox_cleanup(nb, nb_ubiquity, tenant, netbox_sites_dict, _cleanup_serials_by_site)
+
+        logger.info(f"=== Sync run #{run_count} complete ===")
+
+        if sync_interval <= 0:
+            break
+        logger.info(f"Sleeping {sync_interval} seconds until next sync...")
+        _time.sleep(sync_interval)

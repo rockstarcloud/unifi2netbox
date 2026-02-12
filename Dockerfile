@@ -26,6 +26,7 @@ COPY --from=builder /install /usr/local
 COPY main.py /app/
 COPY unifi/ /app/unifi/
 COPY config/ /app/config/
+COPY data/ /app/data/
 
 RUN mkdir -p /app/logs
 
