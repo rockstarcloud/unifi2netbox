@@ -21,10 +21,10 @@ warnings.simplefilter("ignore", InsecureRequestWarning)
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Define threads for each layer
-MAX_CONTROLLER_THREADS = 5  # Number of UniFi controllers to process concurrently
-MAX_SITE_THREADS = 8  # Number of sites to process concurrently per controller
-MAX_DEVICE_THREADS = 8  # Number of devices to process concurrently per site
+# Threading limits (configurable via env vars)
+MAX_CONTROLLER_THREADS = int(os.getenv("MAX_CONTROLLER_THREADS", "5"))
+MAX_SITE_THREADS = int(os.getenv("MAX_SITE_THREADS", "8"))
+MAX_DEVICE_THREADS = int(os.getenv("MAX_DEVICE_THREADS", "8"))
 
 # Populated at runtime from NETBOX roles in env/config
 netbox_device_roles = {}
