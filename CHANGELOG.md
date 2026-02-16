@@ -7,16 +7,28 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
-- Repository cleanup and documentation alignment with actual runtime behavior
+- Nothing yet.
+
+---
+
+## 2026-02-16
 
 ### Changed
-- `README.md` and `docs/*.md` rewritten for technical accuracy and consistent terminology
-- CI workflow now installs `pytest` explicitly and syntax-checks `main.py` + `unifi/*.py`
+- `README.md` and `docs/*.md` updated to match current implementation and runtime behavior
+- `requirements.txt` trimmed to runtime dependencies only (test framework removed from runtime install set)
+- `.gitea/workflows/ci.yaml` now installs `pytest` explicitly for CI and validates syntax for `main.py` and `unifi/*.py`
+- `Dockerfile` updated to stop copying removed standalone client files
+- `lxc/install.sh` repository URL updated to `https://github.com/patricklind/unifi2netbox.git`
+- `lxc/create-lxc.sh` simplified to remove obsolete service-file move flow
+- `unifi/unifi.py` MFA wait path changed from console `print` countdown to logging-based wait
 
 ### Removed
 - Unused standalone client files: `unifi_client.py`, `config.py`, `exceptions.py`, `utils.py`
-- Dead code in core modules (`_get_network_info_for_ip`, unused resource backup/id helpers)
-- Unused test imports
+- Dead code in core modules:
+  - `main.py`: removed `_get_network_info_for_ip()` and unused network-info cache/lock
+  - `unifi/resources.py`: removed unused `get_id()` and `backup()` helpers
+  - `unifi/device.py`, `unifi/networkconf.py`, `unifi/wlanconf.py`: removed unused `output_dir` attributes
+- Unused imports in tests and resource modules
 
 ---
 
