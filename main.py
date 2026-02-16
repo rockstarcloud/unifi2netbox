@@ -50,14 +50,60 @@ _unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = threading.Lock()
 _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
 _cleanup_serials_lock = threading.Lock()
+_unifi_network_info = {}               # subnet_str -> {"gateway": str, "dns": [str]}
+_unifi_network_info_lock = threading.Lock()
+
+
+def _normalize_vrf_name(vrf_name: str) -> str:
+    """
+    Normalize VRF names so lookups are stable and do not create near-duplicates.
+    """
+    if vrf_name is None:
+        return ""
+    # Strip and collapse repeated whitespace.
+    return " ".join(str(vrf_name).strip().split())
+
+
+def _vrf_cache_key(vrf_name: str) -> str:
+    return _normalize_vrf_name(vrf_name).casefold()
+
+
+def _find_vrfs_by_name(nb, vrf_name: str):
+    """
+    Find matching VRFs by name.
+
+    Starts with exact-name API filter for efficiency.
+    Falls back to normalized case-insensitive scan to avoid duplicates when
+    historical data has casing/whitespace drift.
+    """
+    normalized = _normalize_vrf_name(vrf_name)
+    if not normalized:
+        return []
+
+    exact = list(nb.ipam.vrfs.filter(name=normalized))
+    if exact:
+        return exact
+
+    wanted_key = _vrf_cache_key(normalized)
+    matches = []
+    try:
+        for candidate in nb.ipam.vrfs.all():
+            candidate_name = getattr(candidate, "name", "")
+            if _vrf_cache_key(candidate_name) == wanted_key:
+                matches.append(candidate)
+    except Exception as e:
+        logger.debug(f"Failed VRF fallback scan for '{normalized}': {e}")
+
+    return matches
 
 
 def _get_vrf_lock(vrf_name: str) -> threading.Lock:
+    cache_key = _vrf_cache_key(vrf_name)
     with vrf_locks_lock:
-        lock = vrf_locks.get(vrf_name)
+        lock = vrf_locks.get(cache_key)
         if lock is None:
             lock = threading.Lock()
-            vrf_locks[vrf_name] = lock
+            vrf_locks[cache_key] = lock
     return lock
 
 
@@ -68,53 +114,75 @@ def get_or_create_vrf(nb, vrf_name: str):
     NetBox does not enforce VRF name uniqueness, so without a lock multiple
     threads can create duplicates when processing devices in parallel.
     """
+    normalized_name = _normalize_vrf_name(vrf_name)
+    if not normalized_name:
+        return None
+    cache_key = _vrf_cache_key(normalized_name)
+
     with vrf_cache_lock:
-        cached = vrf_cache.get(vrf_name)
-    if cached:
+        cached = vrf_cache.get(cache_key)
+    if cached is not None:
         return cached
 
-    with _get_vrf_lock(vrf_name):
+    with _get_vrf_lock(normalized_name):
         with vrf_cache_lock:
-            cached = vrf_cache.get(vrf_name)
-        if cached:
+            cached = vrf_cache.get(cache_key)
+        if cached is not None:
             return cached
 
-        existing = list(nb.ipam.vrfs.filter(name=vrf_name))
+        existing = _find_vrfs_by_name(nb, normalized_name)
         vrf = None
         if existing:
             # Pick the oldest (lowest id) to keep behavior stable when duplicates already exist.
             vrf = sorted(existing, key=lambda item: item.id or 0)[0]
             if len(existing) > 1:
                 logger.warning(
-                    f"Multiple VRFs with name {vrf_name} found. Using ID {vrf.id}."
+                    f"Multiple VRFs with name {normalized_name} found. Using ID {vrf.id}."
                 )
         else:
-            logger.debug(f"VRF {vrf_name} not found, creating new VRF")
+            logger.debug(f"VRF {normalized_name} not found, creating new VRF")
             try:
-                vrf = nb.ipam.vrfs.create({"name": vrf_name})
-                if vrf:
-                    logger.info(f"VRF {vrf_name} with ID {vrf.id} successfully added to NetBox.")
+                vrf = nb.ipam.vrfs.create({"name": normalized_name})
+                if vrf is not None:
+                    logger.info(f"VRF {normalized_name} with ID {vrf.id} successfully added to NetBox.")
             except pynetbox.core.query.RequestError as e:
-                logger.warning(f"Failed to create VRF {vrf_name}: {e}. Trying to refetch.")
-                existing = list(nb.ipam.vrfs.filter(name=vrf_name))
+                logger.warning(f"Failed to create VRF {normalized_name}: {e}. Trying to refetch.")
+                existing = _find_vrfs_by_name(nb, normalized_name)
                 if existing:
                     vrf = sorted(existing, key=lambda item: item.id or 0)[0]
 
-        if vrf:
+        if vrf is not None:
             with vrf_cache_lock:
-                vrf_cache[vrf_name] = vrf
+                vrf_cache[cache_key] = vrf
         return vrf
 
 
 def get_existing_vrf(nb, vrf_name: str):
     """Get a VRF by name (do not create)."""
-    existing = list(nb.ipam.vrfs.filter(name=vrf_name))
-    if not existing:
+    normalized_name = _normalize_vrf_name(vrf_name)
+    if not normalized_name:
         return None
-    vrf = sorted(existing, key=lambda item: item.id or 0)[0]
-    if len(existing) > 1:
-        logger.warning(f"Multiple VRFs with name {vrf_name} found. Using ID {vrf.id}.")
-    return vrf
+    cache_key = _vrf_cache_key(normalized_name)
+    with vrf_cache_lock:
+        cached = vrf_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    with _get_vrf_lock(normalized_name):
+        with vrf_cache_lock:
+            cached = vrf_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        existing = _find_vrfs_by_name(nb, normalized_name)
+        if not existing:
+            return None
+        vrf = sorted(existing, key=lambda item: item.id or 0)[0]
+        if len(existing) > 1:
+            logger.warning(f"Multiple VRFs with name {normalized_name} found. Using ID {vrf.id}.")
+        with vrf_cache_lock:
+            vrf_cache[cache_key] = vrf
+        return vrf
 
 
 def get_vrf_for_site(nb, site_name: str):
@@ -126,7 +194,7 @@ def get_vrf_for_site(nb, site_name: str):
       - existing/get: use VRF if it exists, never create
       - create/site (legacy behavior): create VRF if missing
     """
-    site_name = (site_name or "").strip()
+    site_name = _normalize_vrf_name(site_name)
     mode = (os.getenv("NETBOX_VRF_MODE") or "existing").strip().lower()
     if mode in {"none", "disabled", "off"}:
         return None, mode
@@ -475,10 +543,45 @@ def extract_dhcp_ranges_from_unifi(site_obj, unifi=None):
             network = ipaddress.ip_network(subnet, strict=False)
             networks_result.append(network)
             logger.debug(f"Found DHCP-enabled network '{net_name}': {subnet}")
+
+            # Capture gateway and DNS for this network
+            gateway = net.get("gateway_ip") or net.get("dhcpd_gateway")
+            dns_servers = []
+            for i in range(1, 5):
+                dns = net.get(f"dhcpd_dns_{i}")
+                if dns and str(dns).strip():
+                    dns_servers.append(str(dns).strip())
+            if gateway or dns_servers:
+                with _unifi_network_info_lock:
+                    _unifi_network_info[str(network)] = {
+                        "gateway": gateway,
+                        "dns": dns_servers,
+                    }
+                logger.debug(f"Network '{net_name}' gateway={gateway}, dns={dns_servers}")
         except ValueError:
             logger.warning(f"Invalid subnet '{subnet}' in UniFi network config. Skipping.")
 
     return networks_result
+
+
+def _get_network_info_for_ip(ip_str):
+    """Look up gateway and DNS for an IP from cached UniFi network configs.
+
+    Returns dict {"gateway": str|None, "dns": [str]} or None if no match.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    with _unifi_network_info_lock:
+        for subnet_str, info in _unifi_network_info.items():
+            try:
+                net = ipaddress.ip_network(subnet_str, strict=False)
+                if ip_obj in net:
+                    return info
+            except ValueError:
+                continue
+    return None
 
 
 def get_all_dhcp_ranges():
@@ -609,10 +712,11 @@ def find_available_static_ip(nb, prefix_obj, vrf, tenant, unifi_device_ips=None,
     return None
 
 
-def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="255.255.252.0", gateway=None):
+def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="255.255.252.0", gateway=None, dns_servers=None):
     """
     Set a static IP on a UniFi device via the controller API.
-    For Integration API: PUT /sites/{siteId}/devices/{deviceId}
+    For Integration API: PATCH /sites/{siteId}/devices/{deviceId}
+    For Legacy API: PUT /api/s/{site}/rest/device/{id}
     """
     device_id = device.get("id") or device.get("_id")
     device_name = get_device_name(device)
@@ -637,14 +741,18 @@ def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="
     api_style = getattr(unifi, "api_style", "legacy")
     if api_style == "integration":
         url = f"/sites/{site_api_id}/devices/{device_id}"
-        payload = {
-            "ipConfig": {
-                "mode": "static",
-                "ip": static_ip,
-                "subnetMask": subnet_mask,
-                "gateway": gateway,
-            }
+        ip_config = {
+            "mode": "static",
+            "ip": static_ip,
+            "subnetMask": subnet_mask,
+            "gateway": gateway,
         }
+        if dns_servers:
+            if len(dns_servers) >= 1:
+                ip_config["preferredDns"] = dns_servers[0]
+            if len(dns_servers) >= 2:
+                ip_config["alternateDns"] = dns_servers[1]
+        payload = {"ipConfig": ip_config}
         try:
             response = unifi.make_request(url, "PATCH", data=payload)
             if isinstance(response, dict):
@@ -652,21 +760,25 @@ def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="
                 if status and int(status) >= 400:
                     logger.warning(f"Failed to set static IP on {device_name} via Integration API: {response.get('message', response)}")
                     return False
-            logger.info(f"Set static IP {static_ip} on UniFi device {device_name}")
+            logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
             return True
         except Exception as e:
             logger.warning(f"Failed to set static IP on {device_name}: {e}")
             return False
     else:
         # Legacy API: PUT /api/s/{site}/rest/device/{id}
-        payload = {
-            "config_network": {
-                "type": "static",
-                "ip": static_ip,
-                "netmask": subnet_mask,
-                "gateway": gateway,
-            }
+        config_network = {
+            "type": "static",
+            "ip": static_ip,
+            "netmask": subnet_mask,
+            "gateway": gateway,
         }
+        if dns_servers:
+            if len(dns_servers) >= 1:
+                config_network["dns1"] = dns_servers[0]
+            if len(dns_servers) >= 2:
+                config_network["dns2"] = dns_servers[1]
+        payload = {"config_network": config_network}
         try:
             site_name = getattr(site_obj, "name", "default")
             url = f"/api/s/{site_name}/rest/device/{device_id}"
@@ -674,7 +786,7 @@ def set_unifi_device_static_ip(unifi, site_obj, device, static_ip, subnet_mask="
             if isinstance(response, dict):
                 meta = response.get("meta", {})
                 if isinstance(meta, dict) and meta.get("rc") == "ok":
-                    logger.info(f"Set static IP {static_ip} on UniFi device {device_name}")
+                    logger.info(f"Set static IP {static_ip} (gw={gateway}, dns={dns_servers}) on UniFi device {device_name}")
                     return True
                 logger.warning(f"Failed to set static IP on {device_name} via legacy API: {response}")
                 return False
