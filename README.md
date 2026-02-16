@@ -6,6 +6,110 @@ NetBox is kept as the authoritative inventory while UniFi provides the operation
 
 ---
 
+## Standalone UniFi Client (Legacy + UniFi OS + v1)
+
+Files:
+- `unifi_client.py`
+- `config.py`
+- `exceptions.py`
+- `utils.py`
+
+### Installation
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Example: Legacy Controller (username/password)
+
+```python
+from unifi_client import UniFiClient
+
+client = UniFiClient(
+    base_url="https://legacy-unifi.example.com",
+    username="api-user",
+    password="api-password",
+    verify_ssl=True,
+    timeout=10,
+)
+
+sites = client.get_sites()
+client.logout()
+```
+
+### Example: UniFi OS + API Key
+
+```python
+from unifi_client import UniFiClient
+
+client = UniFiClient(
+    base_url="https://unifi.example.com/proxy/network",
+    api_key="YOUR_API_KEY",
+    verify_ssl=True,
+    timeout=10,
+)
+
+devices = client.get_devices("default")
+```
+
+### Example: MFA (used only when secret is set)
+
+```python
+from unifi_client import UniFiClient
+
+client = UniFiClient(
+    base_url="https://unifi.example.com",
+    username="api-user",
+    password="api-password",
+    mfa_secret="BASE32SECRET",
+)
+
+sites = client.get_sites()
+```
+
+### Example: Error Handling
+
+```python
+import logging
+
+from exceptions import AuthenticationError, RequestError
+from unifi_client import UniFiClient
+
+logging.basicConfig(level=logging.ERROR)
+
+try:
+    client = UniFiClient(
+        base_url="https://unifi.example.com",
+        api_key="INVALID_OR_EXPIRED_KEY",
+        timeout=10,
+        verify_ssl=True,
+    )
+    client.get_sites()
+except AuthenticationError as exc:
+    logging.error("Authentication failed: %s", exc)
+except RequestError as exc:
+    logging.error("Request failed: %s", exc)
+    if exc.context:
+        logging.error(
+            "statusCode=%s statusName=%s code=%s message=%s requestId=%s",
+            exc.context.status_code,
+            exc.context.status_name,
+            exc.context.code,
+            exc.context.message,
+            exc.context.request_id,
+        )
+```
+
+### Timeout + SSL Configuration
+
+- `timeout` applies to all HTTP requests (login + API calls + probes).
+- `verify_ssl=True` validates server certificates.
+- `verify_ssl=False` disables certificate validation (only for trusted lab/test environments).
+
+---
+
 ## Table of Contents
 
 - [Features](#features)
