@@ -1,14 +1,11 @@
 """Tests for community device specs integration."""
-import json
-import os
-from unittest.mock import patch, mock_open
+from unittest.mock import patch
 import pytest
 
 from main import (
     _load_community_specs,
     _lookup_community_specs,
     _resolve_device_specs,
-    UNIFI_MODEL_SPECS,
 )
 
 

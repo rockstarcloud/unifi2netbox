@@ -17,10 +17,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install pytest~=8.0
 
       - name: Syntax check
-        run: python -m py_compile main.py
+        run: python -m py_compile main.py unifi/*.py
 
       - name: Run tests
         run: pytest tests/ -v

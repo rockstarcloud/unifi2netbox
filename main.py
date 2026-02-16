@@ -50,8 +50,6 @@ _unifi_dhcp_ranges = {}                # site_id -> list of IPv4Network
 _unifi_dhcp_ranges_lock = threading.Lock()
 _cleanup_serials_by_site = {}          # site_id -> set of UniFi serials (for cleanup)
 _cleanup_serials_lock = threading.Lock()
-_unifi_network_info = {}               # subnet_str -> {"gateway": str, "dns": [str]}
-_unifi_network_info_lock = threading.Lock()
 
 
 def _normalize_vrf_name(vrf_name: str) -> str:
@@ -544,44 +542,10 @@ def extract_dhcp_ranges_from_unifi(site_obj, unifi=None):
             networks_result.append(network)
             logger.debug(f"Found DHCP-enabled network '{net_name}': {subnet}")
 
-            # Capture gateway and DNS for this network
-            gateway = net.get("gateway_ip") or net.get("dhcpd_gateway")
-            dns_servers = []
-            for i in range(1, 5):
-                dns = net.get(f"dhcpd_dns_{i}")
-                if dns and str(dns).strip():
-                    dns_servers.append(str(dns).strip())
-            if gateway or dns_servers:
-                with _unifi_network_info_lock:
-                    _unifi_network_info[str(network)] = {
-                        "gateway": gateway,
-                        "dns": dns_servers,
-                    }
-                logger.debug(f"Network '{net_name}' gateway={gateway}, dns={dns_servers}")
         except ValueError:
             logger.warning(f"Invalid subnet '{subnet}' in UniFi network config. Skipping.")
 
     return networks_result
-
-
-def _get_network_info_for_ip(ip_str):
-    """Look up gateway and DNS for an IP from cached UniFi network configs.
-
-    Returns dict {"gateway": str|None, "dns": [str]} or None if no match.
-    """
-    try:
-        ip_obj = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return None
-    with _unifi_network_info_lock:
-        for subnet_str, info in _unifi_network_info.items():
-            try:
-                net = ipaddress.ip_network(subnet_str, strict=False)
-                if ip_obj in net:
-                    return info
-            except ValueError:
-                continue
-    return None
 
 
 def get_all_dhcp_ranges():
@@ -2318,7 +2282,7 @@ def process_device(unifi, nb, site, device, nb_ubiquity, tenant, unifi_device_ip
                 if asset_tag:
                     device_data['asset_tag'] = asset_tag
 
-                logger.debug(f"Getting postable fields for NetBox API")
+                logger.debug("Getting postable fields for NetBox API")
                 available_fields = get_postable_fields(netbox_url, netbox_token, 'dcim/devices')
                 logger.debug(f"Available NetBox API fields: {list(available_fields.keys())}")
                 if 'role' in available_fields:

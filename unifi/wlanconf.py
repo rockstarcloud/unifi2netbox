@@ -11,7 +11,6 @@ class WlanConf(BaseResource):
     def __init__(self, unifi, site, **kwargs):
         self.unifi = unifi
         self.site = site
-        self.output_dir: str = kwargs.get('output_dir', "wlan_configs")
         if getattr(unifi, "api_style", None) == "integration":
             super().__init__(
                 unifi,

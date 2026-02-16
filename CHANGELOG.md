@@ -7,8 +7,16 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
-- Complete documentation overhaul (README, docs/, CHANGELOG, wiki)
-- Improved `.env.example` with grouped sections and safety warnings
+- Repository cleanup and documentation alignment with actual runtime behavior
+
+### Changed
+- `README.md` and `docs/*.md` rewritten for technical accuracy and consistent terminology
+- CI workflow now installs `pytest` explicitly and syntax-checks `main.py` + `unifi/*.py`
+
+### Removed
+- Unused standalone client files: `unifi_client.py`, `config.py`, `exceptions.py`, `utils.py`
+- Dead code in core modules (`_get_network_info_for_ip`, unused resource backup/id helpers)
+- Unused test imports
 
 ---
 

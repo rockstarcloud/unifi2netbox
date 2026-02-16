@@ -1,7 +1,6 @@
 """Tests for cleanup utility functions."""
 import os
 from unittest.mock import patch
-import pytest
 
 from main import _is_cleanup_enabled, _cleanup_stale_days
 

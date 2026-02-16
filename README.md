@@ -1,149 +1,20 @@
 # unifi2netbox
 
-Synchronizes devices, interfaces, VLANs, WLANs, uplink cables, and device type specifications from one or more UniFi Controllers into NetBox.
+Synchronize devices, interfaces, VLANs, WLANs, uplink cables, and device type templates from UniFi controllers into NetBox.
 
-NetBox is kept as the authoritative inventory while UniFi provides the operational data. Synchronization direction: **UniFi → NetBox** (no data is written back to UniFi).
-
----
-
-## Standalone UniFi Client (Legacy + UniFi OS + v1)
-
-Files:
-- `unifi_client.py`
-- `config.py`
-- `exceptions.py`
-- `utils.py`
-
-### Installation
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Example: Legacy Controller (username/password)
-
-```python
-from unifi_client import UniFiClient
-
-client = UniFiClient(
-    base_url="https://legacy-unifi.example.com",
-    username="api-user",
-    password="api-password",
-    verify_ssl=True,
-    timeout=10,
-)
-
-sites = client.get_sites()
-client.logout()
-```
-
-### Example: UniFi OS + API Key
-
-```python
-from unifi_client import UniFiClient
-
-client = UniFiClient(
-    base_url="https://unifi.example.com/proxy/network",
-    api_key="YOUR_API_KEY",
-    verify_ssl=True,
-    timeout=10,
-)
-
-devices = client.get_devices("default")
-```
-
-### Example: MFA (used only when secret is set)
-
-```python
-from unifi_client import UniFiClient
-
-client = UniFiClient(
-    base_url="https://unifi.example.com",
-    username="api-user",
-    password="api-password",
-    mfa_secret="BASE32SECRET",
-)
-
-sites = client.get_sites()
-```
-
-### Example: Error Handling
-
-```python
-import logging
-
-from exceptions import AuthenticationError, RequestError
-from unifi_client import UniFiClient
-
-logging.basicConfig(level=logging.ERROR)
-
-try:
-    client = UniFiClient(
-        base_url="https://unifi.example.com",
-        api_key="INVALID_OR_EXPIRED_KEY",
-        timeout=10,
-        verify_ssl=True,
-    )
-    client.get_sites()
-except AuthenticationError as exc:
-    logging.error("Authentication failed: %s", exc)
-except RequestError as exc:
-    logging.error("Request failed: %s", exc)
-    if exc.context:
-        logging.error(
-            "statusCode=%s statusName=%s code=%s message=%s requestId=%s",
-            exc.context.status_code,
-            exc.context.status_name,
-            exc.context.code,
-            exc.context.message,
-            exc.context.request_id,
-        )
-```
-
-### Timeout + SSL Configuration
-
-- `timeout` applies to all HTTP requests (login + API calls + probes).
-- `verify_ssl=True` validates server certificates.
-- `verify_ssl=False` disables certificate validation (only for trusted lab/test environments).
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Community Device Specs](#community-device-specs)
-- [NetBox Cleanup](#netbox-cleanup)
-- [Continuous Sync](#continuous-sync)
-- [Supported Hardware](#supported-hardware)
-- [Architecture](#architecture)
-- [Testing](#testing)
-- [Documentation](#documentation)
-- [Contributing](#contributing)
-- [License](#license)
-
----
+Synchronization direction is one-way: **UniFi -> NetBox**.
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| **Device Sync** | Creates and updates devices with serial, MAC, firmware, IP, model, site |
-| **Interface Sync** | Physical ports, radio interfaces, speed, PoE mode, MAC |
-| **Device Type Specs** | Auto-populates port templates, console/power ports from 173+ Ubiquiti models |
-| **VLAN / WLAN Sync** | Imports UniFi networks and wireless SSIDs into NetBox |
-| **Cable Sync** | Maps uplink cables between devices |
-| **DHCP Auto-Discovery** | Detects DHCP ranges from UniFi and assigns static IPs |
-| **VRF Support** | Optional VRF per site (existing, create, or none) |
-| **Cleanup** | Deletes stale devices, orphan interfaces/IPs/cables, unused device types |
-| **Continuous Sync** | Runs every N seconds (configurable, default 10 min) |
-| **Multi-Controller** | Supports multiple UniFi controllers in parallel |
-| **Dual API** | Works with both Integration API (v1) and Legacy API (username/password) |
-
----
+- UniFi Integration API (v1) support with API key auth
+- UniFi OS / legacy session auth fallback (username/password, optional MFA)
+- Multi-controller processing in parallel
+- Interface, VLAN, WLAN, and uplink cable sync
+- Device type enrichment from:
+  - hardcoded `UNIFI_MODEL_SPECS` in `main.py`
+  - bundled community library (`data/ubiquiti_device_specs.json`)
+- Optional destructive NetBox cleanup (`NETBOX_CLEANUP=true`)
+- Continuous sync loop (`SYNC_INTERVAL`) or run-once mode
 
 ## Quick Start
 
@@ -151,216 +22,144 @@ except RequestError as exc:
 
 ```bash
 cp .env.example .env
-# Edit .env with your UniFi and NetBox credentials
-docker compose up --build
+# edit .env
+docker compose up --build -d
+docker compose logs -f
 ```
 
-The container syncs continuously every 10 minutes by default (`SYNC_INTERVAL=600`).
+Notes:
+- The sample `.env.example` sets `SYNC_INTERVAL=600` (10 minutes).
+- If `SYNC_INTERVAL` is unset, code default is `0` (run once and exit).
 
-### LXC / Proxmox
-
-```bash
-bash lxc/create-lxc.sh [CTID]
-# Edit /opt/unifi2netbox/.env inside the container
-systemctl start unifi2netbox
-```
-
-### Bare-metal / VM
+### Bare-metal / VM (systemd installer)
 
 ```bash
 sudo bash lxc/install.sh
-# Edit /opt/unifi2netbox/.env
+# edit /opt/unifi2netbox/.env
 systemctl start unifi2netbox
+journalctl -u unifi2netbox -f
 ```
 
----
+### Proxmox LXC helper
+
+```bash
+bash lxc/create-lxc.sh [CTID]
+```
 
 ## Configuration
 
-Configuration comes from environment variables (`.env`) with optional YAML override (`config/config.yaml`). Environment variables take precedence.
+Configuration is built from:
+- `config/config.yaml` (optional)
+- environment variables (`.env`)
 
-See [`.env.example`](.env.example) for a fully commented reference of all 37 environment variables.
+Environment variables override YAML values.
 
-For detailed configuration documentation, see [docs/configuration.md](docs/configuration.md).
+### Required
 
-### Essential Variables
+- `UNIFI_URLS`
+- `NETBOX_URL`
+- `NETBOX_TOKEN`
+- `NETBOX_TENANT`
+- UniFi credentials:
+  - either `UNIFI_API_KEY`
+  - or `UNIFI_USERNAME` + `UNIFI_PASSWORD`
 
-| Variable | Required | Description |
-|---|---|---|
-| `UNIFI_URLS` | Yes | Controller URL(s) |
-| `UNIFI_API_KEY` | * | API key (Integration API) |
-| `UNIFI_USERNAME` / `UNIFI_PASSWORD` | * | Credentials (Legacy API) |
-| `NETBOX_URL` | Yes | NetBox base URL |
-| `NETBOX_TOKEN` | Yes | NetBox API token |
-| `NETBOX_TENANT` | Yes | Tenant name |
+### API modes
 
-\* Either API key or username/password is required.
+- **Integration API v1** (preferred):
+  - URL examples:
+    - `https://controller.example.com/proxy/network/integration/v1`
+    - `https://controller.example.com/integration/v1`
+  - Auth header candidates are auto-probed (`X-API-KEY`, `Authorization`, or custom `UNIFI_API_KEY_HEADER`)
 
-### Feature Toggles
+- **Session login (legacy / UniFi OS)**:
+  - login endpoints are auto-tried:
+    - `/api/auth/login` (UniFi OS)
+    - `/api/login` (legacy)
 
-| Variable | Default | Description |
-|---|---|---|
-| `SYNC_INTERFACES` | `true` | Sync physical ports and radios |
-| `SYNC_VLANS` | `true` | Sync VLANs from UniFi networks |
-| `SYNC_WLANS` | `true` | Sync wireless SSIDs |
-| `SYNC_CABLES` | `true` | Sync uplink cables |
-| `SYNC_STALE_CLEANUP` | `true` | Mark missing devices offline |
-| `NETBOX_CLEANUP` | `false` | **Destructive** cleanup of stale data |
-| `SYNC_INTERVAL` | `600` | Seconds between sync runs (0 = once) |
+### Common toggles
 
----
+- `SYNC_INTERFACES`, `SYNC_VLANS`, `SYNC_WLANS`, `SYNC_CABLES`
+- `SYNC_STALE_CLEANUP`
+- `NETBOX_CLEANUP`
+- `CLEANUP_STALE_DAYS`
+- `NETBOX_VRF_MODE` (`none`, `existing`, `create`)
+- `NETBOX_SERIAL_MODE` (`mac`, `unifi`, `id`, `none`)
+- `MAX_CONTROLLER_THREADS`, `MAX_SITE_THREADS`, `MAX_DEVICE_THREADS`
 
-## Community Device Specs
+Full reference: `docs/configuration.md`.
 
-unifi2netbox includes a bundled hardware database of **173 Ubiquiti device types** sourced from the [netbox-community/devicetype-library](https://github.com/netbox-community/devicetype-library).
+## Device Type Specs
 
-For each known device, the following is automatically populated:
+Data sources merged at runtime:
+- `UNIFI_MODEL_SPECS` in `main.py` (**42 hardcoded models**)
+- `data/ubiquiti_device_specs.json` (**173 by model**, **166 by part number**)
 
-- Interface templates with correct types (1000base-t, 10gbase-x-sfpp, etc.)
-- PoE mode and type per port
-- Console port templates (RJ-45)
-- Power port templates with max/allocated draw
-- Part number, U height, airflow, weight
-- Full depth and rack-mount info
+Hardcoded fields override community fields when both exist.
 
-The community specs are merged with a hardcoded database (`UNIFI_MODEL_SPECS`) of ~47 models. Hardcoded values always take precedence, ensuring manual overrides are preserved.
+Details: `docs/device-specs.md`.
 
-**New devices**: When an unknown UniFi device appears, unifi2netbox automatically creates a rich device type from the community database if a match is found.
+## Cleanup
 
-See [docs/device-specs.md](docs/device-specs.md) for details on the merge logic and how to add custom specs.
+When `NETBOX_CLEANUP=true`, cleanup runs after sync and can delete:
+- stale devices
+- garbage interfaces (`?` in name)
+- orphan IPs
+- orphan cables
+- unused Ubiquiti device types
 
----
+Guide: `docs/cleanup.md`.
 
-## NetBox Cleanup
+## Project Structure
 
-> **Warning**: This feature permanently deletes data from NetBox. Test thoroughly before enabling in production.
-
-Enable with `NETBOX_CLEANUP=true`. The cleanup phase runs after each sync and removes:
-
-| What | Description |
-|---|---|
-| **Stale devices** | Devices in NetBox not found in UniFi (after grace period) |
-| **Garbage interfaces** | Interfaces with `?` in the name |
-| **Orphan IPs** | IP addresses with no assigned object |
-| **Orphan cables** | Cables with missing terminations |
-| **Unused device types** | Device types with zero devices assigned |
-
-The grace period (`CLEANUP_STALE_DAYS`, default 30) prevents deletion of temporarily offline devices. Set to `0` for immediate cleanup.
-
-See [docs/cleanup.md](docs/cleanup.md) for safety guidelines and best practices.
-
----
-
-## Continuous Sync
-
-The `SYNC_INTERVAL` variable controls how often the sync loop runs:
-
-| Value | Behavior |
-|---|---|
-| `0` | Run once and exit (for cron or systemd timer) |
-| `600` | Every 10 minutes (recommended for Docker) |
-| `300` | Every 5 minutes |
-| `3600` | Every hour |
-
-Between runs, per-run caches are cleared to ensure fresh data.
-
----
-
-## Supported Hardware
-
-The bundled database covers **173 Ubiquiti models** including switches, gateways, access points, and UISP/airMAX devices.
-
-The hardcoded specs (`UNIFI_MODEL_SPECS`) include detailed port definitions for ~47 commonly deployed models. All 173 models from the community library get full interface/console/power port templates.
-
-Devices not in either database are still synced — they just won't have pre-configured templates.
-
-See [docs/device-specs.md](docs/device-specs.md) for the full list.
-
----
-
-## Architecture
-
+```text
+.
+├── main.py
+├── unifi/
+│   ├── unifi.py
+│   ├── resources.py
+│   ├── sites.py
+│   ├── device.py
+│   ├── networkconf.py
+│   └── wlanconf.py
+├── data/
+│   └── ubiquiti_device_specs.json
+├── config/
+│   ├── config.yaml.SAMPLE
+│   └── site_mapping.yaml
+├── docs/
+├── tests/
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
 ```
-UniFi Controller(s)
-  ↓ (Integration API v1 or Legacy API)
-UniFi API wrapper (unifi/)
-  ↓
-Normalization & Mapping (main.py)
-  ↓ (pynetbox)
-NetBox API
-```
-
-### Threading Model
-
-```
-Controller Pool (MAX_CONTROLLER_THREADS=5)
-  └── Site Pool (MAX_SITE_THREADS=8)
-        └── Device Pool (MAX_DEVICE_THREADS=8)
-```
-
-All thread limits are configurable via environment variables. HTTP connection pool: 50 connections. Thread-safe caches with dedicated locks for VRFs, custom fields, tags, VLANs, cables, and device type specs.
-
-### File Structure
-
-| File / Directory | Purpose |
-|---|---|
-| `main.py` | Core orchestration, sync, cleanup (~3000 lines) |
-| `unifi/` | UniFi API abstraction (Integration + Legacy) |
-| `config/` | YAML configuration and site mapping |
-| `data/` | Bundled community device specs (JSON) |
-| `tests/` | pytest test suite |
-| `lxc/` | LXC/Proxmox deployment scripts |
-| `docs/` | Extended documentation |
-| `.gitea/workflows/` | CI/CD pipeline |
-
-See [docs/architecture.md](docs/architecture.md) for deep-dive into threading, caching, and API flows.
-
----
 
 ## Testing
 
-Run the test suite:
-
 ```bash
 pip install -r requirements.txt
+pip install pytest~=8.0
 pytest tests/ -v
 ```
 
-48 tests covering:
-- Device helper functions (name, serial, MAC, IP extraction)
-- Community device specs (loading, lookup, merge)
-- Cleanup configuration (env var parsing)
-
----
+Current suite: **52 tests**.
 
 ## Documentation
 
-- **[Configuration Reference](docs/configuration.md)** — all 37 env vars with examples
-- **[Cleanup Guide](docs/cleanup.md)** — safety guidelines for destructive cleanup
-- **[Device Specs](docs/device-specs.md)** — community specs, merge logic, custom models
-- **[Architecture](docs/architecture.md)** — threading, caching, API compatibility
-- **[Troubleshooting](docs/troubleshooting.md)** — common issues and solutions
-- **[FAQ](docs/faq.md)** — frequently asked questions
-- **[Changelog](CHANGELOG.md)** — version history
+- `docs/configuration.md`
+- `docs/cleanup.md`
+- `docs/device-specs.md`
+- `docs/architecture.md`
+- `docs/troubleshooting.md`
+- `docs/faq.md`
+- `CHANGELOG.md`
 
----
+## Important Runtime Notes
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Write tests for new functionality
-4. Ensure `pytest tests/ -v` passes
-5. Submit a pull request
-
-The CI pipeline (Gitea Actions) runs syntax checks, tests, and Docker build on every push.
-
----
+- UniFi requests are sent with `verify=False` in current implementation.
+- NetBox client session is also configured with `verify=False`.
+- Validate this behavior against your security requirements before production use.
 
 ## License
 
-[MIT License](LICENSE)
-
----
-
-> **Disclaimer**: This tool performs direct write operations in NetBox via API. Validate configuration and test thoroughly before production use.
+MIT (`LICENSE`).

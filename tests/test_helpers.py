@@ -1,7 +1,6 @@
 """Tests for device helper functions in main.py."""
 import os
 from unittest.mock import patch
-import pytest
 
 from main import (
     get_device_name,

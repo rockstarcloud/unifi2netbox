@@ -53,10 +53,7 @@ sleep 5
 
 # Push installer into the container and run it
 pct push "${CTID}" "lxc/install.sh" "/tmp/install.sh"
-pct push "${CTID}" "lxc/unifi2netbox.service" "/tmp/unifi2netbox.service"
 pct exec "${CTID}" -- bash -c "
-    mkdir -p /opt/unifi2netbox/lxc
-    mv /tmp/unifi2netbox.service /opt/unifi2netbox/lxc/
     bash /tmp/install.sh
 "
 

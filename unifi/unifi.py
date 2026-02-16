@@ -68,7 +68,6 @@ class Unifi:
         self.api_key_header = api_key_header
 
         self.session = requests.Session()
-        self.session_cookie = None
         self.csrf_token = None
         self.auth_mode = None
         self.api_prefix = ""
@@ -338,16 +337,12 @@ class Unifi:
         logger.warning(
             f"Invalid 2FA token detected. Next token available in {time_remaining}s."
         )
-        while time_remaining > 0:
-            print(f"\rRetrying authentication in {time_remaining} seconds...", end="")
-            time.sleep(1)
-            time_remaining -= 1
-        print("\nRetrying now!")
+        if time_remaining > 0:
+            time.sleep(time_remaining)
+        logger.info("Retrying UniFi authentication with next 2FA token.")
 
     def _refresh_session_metadata(self, response=None):
         """Refresh auth metadata from session cookies and response headers."""
-        cookie_dict = self.session.cookies.get_dict()
-        self.session_cookie = cookie_dict.get("unifises") or cookie_dict.get("TOKEN")
         if response:
             self.csrf_token = (
                 response.headers.get("X-CSRF-Token")

@@ -14,7 +14,7 @@ set -euo pipefail
 
 APP_DIR="/opt/unifi2netbox"
 APP_USER="unifi2netbox"
-REPO_URL="https://github.com/unifi2netbox/unifi2netbox.git"
+REPO_URL="https://github.com/patricklind/unifi2netbox.git"
 BRANCH="main"
 VENV_DIR="${APP_DIR}/venv"
 

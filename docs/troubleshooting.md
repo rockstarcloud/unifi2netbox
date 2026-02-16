@@ -8,7 +8,7 @@
 
 **Solutions**:
 - Verify the URL is correct and reachable from the Docker container/host
-- For Integration API: ensure the URL ends with `/proxy/network/integration/v1`
+- For Integration API: use `/proxy/network/integration/v1` (or `/integration/v1`)
 - For Legacy API: ensure port 8443 is accessible
 - Increase `UNIFI_REQUEST_TIMEOUT` (default: 15 seconds)
 - Check firewall rules
@@ -77,7 +77,7 @@
 
 **Problem**: `InsecureRequestWarning` in logs.
 
-**Solution**: SSL verification is disabled by default for self-signed certificates. This is expected behavior. To enable verification, modify the HTTP session in main.py.
+**Solution**: SSL verification is disabled by default for self-signed certificates. This is expected behavior in the current implementation. To enforce TLS verification, update both NetBox and UniFi request settings in `main.py` and `unifi/unifi.py`.
 
 ---
 

@@ -1,10 +1,4 @@
 import logging
-import os
-from datetime import datetime, timedelta
-import json
-import threading
-
-file_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -178,37 +172,6 @@ class BaseResource:
         logger.debug(f"Retrieved non-list data from {self.endpoint}, normalizing to single-item list")
         return [data]
 
-    def get_id(self, name: str) -> int:
-        """
-        Retrieves the unique identifier of a given endpoint by its name. The method matches the
-        specified name with the set of data returned from the predefined endpoint's data
-        retrieval process.
-
-        If successful, it returns the unique identifier (_id) of the matching endpoint. If there
-        is any issue, such as the name not being found or the response being invalid, it logs
-        an error or warning and returns None.
-
-        :param name: The name of the endpoint used to search for its unique identifier.
-        :type name: str
-        :raises ValueError: If the provided name is empty or None.
-        :return: The unique identifier (_id) of the endpoint if found, otherwise None.
-        :rtype: int or None
-        """
-        if not name:
-            raise ValueError(f'Name required to get the endpoint id.')
-
-        response = self.all()
-        if response:
-            for item in response:
-                if item.get('name') == name:
-                    return item.get('_id')
-        else:
-            logger.error(f'Could not find {self.endpoint} ID for {name}.')
-            return None
-
-        logger.warning(f'Could not find {self.endpoint} ID for {name}.')
-        return None
-
     def create(self, data: dict = None):
         """
         Creates a new resource using the provided data, or default data if none is
@@ -283,74 +246,3 @@ class BaseResource:
             return True
         logger.error(f"Failed to delete {self.endpoint} with ID {item_id} at site {self.site.name}: {self._response_error_message(response)}")
         return False
-
-    def backup(self, backup_dir: str):
-        """
-        Backup the configuration of the given resource and clean up older backups.
-
-        Each backup file is named after `Site.desc` and stores the configuration in the following structure:
-        - object.endpoint:
-            - date and time:
-                - data
-
-        Files older than 4 months are deleted automatically.
-
-        :param resource: The resource object to back up. Must have `site` and `endpoint` attributes.
-        :param backup_dir: Path to the directory where backups will be stored.
-        """
-        # Ensure the backup directory exists
-        if not os.path.exists(backup_dir):
-            os.makedirs(backup_dir)
-            logger.info(f"Backup directory created: {backup_dir}")
-
-        # Get the site description and endpoint
-        site_desc = self.site.desc
-        endpoint = self.endpoint
-        item_id = self._id
-
-        # Current date and time for backup categorization
-        now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-
-        # Backup file path
-        backup_file_path = os.path.join(backup_dir, f"{site_desc}.json")
-
-        # Prepare the backup data structure
-        backup_data = {}
-        if os.path.exists(backup_file_path):
-            try:
-                with open(backup_file_path, "r") as f:
-                    backup_data = json.load(f)  # Load existing backup
-            except json.JSONDecodeError:
-                logger.warning(f"Backup file {backup_file_path} is corrupted. A new backup will be created.")
-
-        if endpoint not in backup_data:
-            backup_data[endpoint] = {}
-
-        # Retrieve configuration to be backed up
-        data = self.data
-
-        # Add the new backup at the current timestamp and item_id
-        if timestamp not in backup_data[endpoint]:
-            backup_data[endpoint][timestamp] = {}
-
-        backup_data[endpoint][timestamp][item_id] = data
-
-        # Write back to the backup file
-        with file_lock:
-            with open(backup_file_path, "w") as f:
-                json.dump(backup_data, f, indent=4)
-                logger.info(f"Configuration backed up for site '{site_desc}' at endpoint '{endpoint}'.")
-
-        # Clean up old backups (older than 4 months)
-        cutoff_date = now - timedelta(days=4 * 30)  # Approximate 4 months as 120 days
-
-        for date_str in list(backup_data[endpoint].keys()):
-            backup_date = datetime.strptime(date_str, "%Y-%m-%d_%H-%M-%S")
-            if backup_date < cutoff_date:
-                del backup_data[endpoint][date_str]
-                logger.info(f"Deleted old backup from {date_str} for '{endpoint}'.")
-
-        # Save cleaned data back to the backup file
-        with open(backup_file_path, "w") as f:
-            json.dump(backup_data, f, indent=4)
