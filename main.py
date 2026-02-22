@@ -2010,6 +2010,7 @@ UNIFI_MODEL_SPECS = {
     "U6 Lite":      {"part_number": "U6-Lite",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
     "UFLHD":        {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
     "FlexHD":       {"part_number": "UAP-FlexHD",           "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
+    "U7 Pro":       {"part_number": "U7-Pro",           "u_height": 0, "ports": [("Port 1", "2.5gbase-t", 1)], "poe_budget": 0},
     # ── UISP / airMAX ────────────────────────────────────────
     "Rocket Prism 5AC Gen2":{"part_number": "RP-5AC-Gen2",  "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
     "LiteAP AC":    {"part_number": "LAP-120",              "u_height": 0, "ports": [("eth0", "1000base-t", 1)], "poe_budget": 0},
